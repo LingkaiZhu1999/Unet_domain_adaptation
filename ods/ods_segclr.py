@@ -1,17 +1,20 @@
 import torch
-from loss.new_nt_xent import NTXentLoss
+import sys
+sys.path.insert(1, '/home/lingkai/lingkai/simCLR_unet_brats/loss')
+from nt_xent import NTXentLoss
 import torch.nn.functional as F
 # from loss.BCEDiceLoss import BCEDiceLoss
 from ods_unet import SegCLR_U_Net
 from tqdm import tqdm
 import time
+sys.path.insert(1, '/home/lingkai/lingkai/simCLR_unet_brats')
+from utils import draw_training, draw_training_loss, draw_training_joint_on_source
 from metrics import compute_dice, Dice, AverageLoss
 from ods_dataloader import ImageDataset
 from glob import glob
 import albumentations as A
 import os
 import numpy as np
-from ..utils import draw_training, draw_training_loss, draw_training_joint_on_source
 import pickle
 import random 
 from torch.cuda.amp.grad_scaler import GradScaler
@@ -41,7 +44,7 @@ class SegCLR(object):
     def joint_train_on_source_and_target(self):
 
         print(self.args.contrastive_mode)
-        writer = SummaryWriter(log_dir=f'./models/{self.args.name}')
+        writer = SummaryWriter(log_dir=f'../models/{self.args.name}')
         
         train_transform = A.Compose([
         A.RandomRotate90(p=0.5),
@@ -51,11 +54,11 @@ class SegCLR(object):
         A.Resize(576, 576, always_apply=True, interpolation=cv2.INTER_AREA)],
         )
 
-        train_source_dataset = ImageDataset(dataset=self.args.domain_source, image_path=f'../{self.args.domain_source}/crop/images/', mask_path=f'../{self.args.domain_source}/crop/masks/', mode='train', split_path=f'../{self.args.domain_source}/{self.args.domain_source}_split.csv', augmentation=train_transform, pair_gen=True)
-        train_target_dataset = ImageDataset(dataset=self.args.domain_target, image_path=f'../{self.args.domain_target}/crop/images/', mask_path=f'../{self.args.domain_target}/crop/masks/', mode='all', split_path=f'../{self.args.domain_target}/{self.args.domain_target}_split.csv', augmentation=train_transform, pair_gen=True)
+        train_source_dataset = ImageDataset(dataset=self.args.domain_source, image_path=f'{self.args.path}/{self.args.domain_source}/crop/images/', mask_path=f'{self.args.path}/{self.args.domain_source}/crop/masks/', mode='train', split_path=f'{self.args.path}/{self.args.domain_source}/{self.args.domain_source}_split.csv', augmentation=train_transform, pair_gen=True)
+        train_target_dataset = ImageDataset(dataset=self.args.domain_target, image_path=f'{self.args.path}/{self.args.domain_target}/crop/images/', mask_path=f'{self.args.path}/{self.args.domain_target}/crop/masks/', mode='all', split_path=f'{self.args.path}/{self.args.domain_target}/{self.args.domain_target}_split.csv', augmentation=train_transform, pair_gen=True)
 
         
-        val_source_dataset = ImageDataset(dataset=self.args.domain_source, image_path=f'../{self.args.domain_source}/crop/images/', mask_path=f'../{self.args.domain_source}/crop/masks/', mode='val', split_path=f'../{self.args.domain_source}/{self.args.domain_source}_split.csv', augmentation=train_transform, pair_gen=True, val_source=True)
+        val_source_dataset = ImageDataset(dataset=self.args.domain_source, image_path=f'{self.args.path}/{self.args.domain_source}/crop/images/', mask_path=f'{self.args.path}/{self.args.domain_source}/crop/masks/', mode='val', split_path=f'{self.args.path}/{self.args.domain_source}/{self.args.domain_source}_split.csv', augmentation=train_transform, pair_gen=True, val_source=True)
         train_val_source_dataset = ConcatDataset([train_source_dataset, val_source_dataset])
         val_target_dataset = train_target_dataset
 
@@ -206,23 +209,23 @@ class SegCLR(object):
                     'total_training_loss': np.add(np.array(loss_contrast_avg_), self.args.lam * np.array(loss_supervise_avg_)),
                     'total_val_loss': val_loss_
                 })
-                df.to_csv(f'./models/{self.args.name}/log.csv', index=False)
+                df.to_csv(f'../models/{self.args.name}/log.csv', index=False)
                 end_time = time.time()
                 draw_training(epoch + 1, loss_supervise_avg_, loss_contrast_avg_, dice_avg_train, val_loss_, fig_name=self.args.name, lam=self.args.lam)
                 if val_loss < best_val_loss:
                     trigger = 0
                     best_val_loss = val_loss
-                    torch.save(model.state_dict(), os.path.join(f'./models/{self.args.name}', 'best_total_val_loss_model.pt'))
+                    torch.save(model.state_dict(), os.path.join(f'../models/{self.args.name}', 'best_total_val_loss_model.pt'))
                     print("Saving best model")
                 if val_supervise < best_val_supervise_loss:
                     best_val_supervise_loss = val_supervise
-                    torch.save(model.state_dict(), os.path.join(f'./models/{self.args.name}', 'best_supervise_val_loss_model.pt'))
+                    torch.save(model.state_dict(), os.path.join(f'../models/{self.args.name}', 'best_supervise_val_loss_model.pt'))
                 # if val_contrastive_target < best_val_contrastive_loss:
                 #     best_val_contrastive_loss = val_contrastive
-                #     torch.save(model.state_dict(), os.path.join(f'./models/{self.args.name}', 'best_contrastive_val_loss_model.pt'))
+                #     torch.save(model.state_dict(), os.path.join(f'../models/{self.args.name}', 'best_contrastive_val_loss_model.pt'))
                 if val_dice > best_val_dice:
                     best_val_dice = val_dice
-                    torch.save(model.state_dict(), os.path.join(f'./models/{self.args.name}', 'best_val_dice_model.pt'))
+                    torch.save(model.state_dict(), os.path.join(f'../models/{self.args.name}', 'best_val_dice_model.pt'))
                 print("Valid:\t Epoch[{:0>3}/{:0>3}] Loss: {:.4f} Time: {:.2f}s \n".format(
                     epoch + 1, self.args.epochs, val_loss,
                     (end_time - start_time)))
@@ -238,7 +241,7 @@ class SegCLR(object):
     
     def joint_train_on_source(self):
         print(self.args.contrastive_mode)
-        writer = SummaryWriter(log_dir=f'./models/{self.args.name}')
+        writer = SummaryWriter(log_dir=f'../models/{self.args.name}')
         print('Only Source Domain')
         train_transform = A.Compose([
         A.RandomRotate90(p=0.5),
@@ -248,11 +251,11 @@ class SegCLR(object):
         A.Resize(576, 576, always_apply=True, interpolation=cv2.INTER_AREA)],
         )
 
-        train_source_dataset = ImageDataset(dataset=self.args.domain_source, image_path=f'../{self.args.domain_source}/crop/images/', mask_path=f'../{self.args.domain_source}/crop/masks/', mode='train', split_path=f'../{self.args.domain_source}/{self.args.domain_source}_split.csv', augmentation=train_transform, pair_gen=True)
+        train_source_dataset = ImageDataset(dataset=self.args.domain_source, image_path=f'{self.args.path}/{self.args.domain_source}/crop/images/', mask_path=f'{self.args.path}/{self.args.domain_source}/crop/masks/', mode='train', split_path=f'{self.args.path}/{self.args.domain_source}/{self.args.domain_source}_split.csv', augmentation=train_transform, pair_gen=True)
        
 
         
-        val_source_dataset = ImageDataset(dataset=self.args.domain_source, image_path=f'../{self.args.domain_source}/crop/images/', mask_path=f'../{self.args.domain_source}/crop/masks/', mode='val', split_path=f'../{self.args.domain_source}/{self.args.domain_source}_split.csv', augmentation=train_transform, pair_gen=True, val_source=True)
+        val_source_dataset = ImageDataset(dataset=self.args.domain_source, image_path=f'{self.args.path}/{self.args.domain_source}/crop/images/', mask_path=f'{self.args.path}/{self.args.domain_source}/crop/masks/', mode='val', split_path=f'{self.args.path}/{self.args.domain_source}/{self.args.domain_source}_split.csv', augmentation=train_transform, pair_gen=True, val_source=True)
         train_val_source_dataset = ConcatDataset([train_source_dataset, val_source_dataset])
 
         train_source_loader = torch.utils.data.DataLoader(train_source_dataset,batch_size=self.args.batch_size,shuffle=True,num_workers=2,pin_memory=True,drop_last=False)
@@ -357,23 +360,23 @@ class SegCLR(object):
                     'total_training_loss': np.add(np.array(loss_contrast_avg_), self.args.lam * np.array(loss_supervise_avg_)),
                     'total_val_loss': val_loss_
                 })
-                df.to_csv(f'./models/{self.args.name}/log.csv', index=False)
+                df.to_csv(f'../models/{self.args.name}/log.csv', index=False)
                 end_time = time.time()
                 # draw_training(epoch + 1, loss_supervise_avg_, loss_contrast_avg_, dice_avg_train, val_loss_, fig_name=self.args.name, lam=self.args.lam)
                 if val_loss < best_val_loss:
                     trigger = 0
                     best_val_loss = val_loss
-                    torch.save(model.state_dict(), os.path.join(f'./models/{self.args.name}', 'best_total_val_loss_model.pt'))
+                    torch.save(model.state_dict(), os.path.join(f'../models/{self.args.name}', 'best_total_val_loss_model.pt'))
                     print("Saving best model")
                 if val_supervise < best_val_supervise_loss:
                     best_val_supervise_loss = val_supervise
-                    torch.save(model.state_dict(), os.path.join(f'./models/{self.args.name}', 'best_supervise_val_loss_model.pt'))
+                    torch.save(model.state_dict(), os.path.join(f'../models/{self.args.name}', 'best_supervise_val_loss_model.pt'))
                 # if val_contrastive_target < best_val_contrastive_loss:
                 #     best_val_contrastive_loss = val_contrastive
-                #     torch.save(model.state_dict(), os.path.join(f'./models/{self.args.name}', 'best_contrastive_val_loss_model.pt'))
+                #     torch.save(model.state_dict(), os.path.join(f'../models/{self.args.name}', 'best_contrastive_val_loss_model.pt'))
                 if val_dice > best_val_dice:
                     best_val_dice = val_dice
-                    torch.save(model.state_dict(), os.path.join(f'./models/{self.args.name}', 'best_val_dice_model.pt'))
+                    torch.save(model.state_dict(), os.path.join(f'../models/{self.args.name}', 'best_val_dice_model.pt'))
                 print("Valid:\t Epoch[{:0>3}/{:0>3}] Loss: {:.4f} Time: {:.2f}s \n".format(
                     epoch + 1, self.args.epochs, val_loss,
                     (end_time - start_time)))

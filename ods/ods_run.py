@@ -19,7 +19,7 @@ def parse_args():
                         help='number of total epochs to run')
     parser.add_argument('--early-stop', default=50, type=int,
                         metavar='N', help='early stopping (default: 20)')
-    parser.add_argument('-b', '--batch-size', default=4, type=int,
+    parser.add_argument('-b', '--batch-size', default=8, type=int,
                         metavar='N', help='mini-batch size (default: 16)')
     parser.add_argument('--optimizer', default='SGD',
                         choices=['Adam', 'SGD'],
@@ -40,25 +40,24 @@ def parse_args():
     parser.add_argument('--temperature', default=0.5, type=float)
     parser.add_argument('--validate_frequency', default=1, type=int)
     parser.add_argument('--seed', type=int, default=1) # seed
+    parser.add_argument('--path', default='../..')
+    parser.add_argument('--lam', default=10000, type=int) # lambda 
 
-    parser.add_argument('--lam', default=1000, type=int) # lambda 
-
-    parser.add_argument('--device', default='cuda:1')
+    parser.add_argument('--device', default='cuda:0')
     parser.add_argument('--mode', default='aug')
     parser.add_argument('--contrastive_mode', default='only_source_domain') # con mode
     args = parser.parse_args()
-    # args.name = f'Eye_{args.domain_source}_adapt_{args.domain_target}_lambda_{args.lam}_batchsize_{args.batch_size}_{args.contrastive_mode}_{args.mode}_Cch_seed_{args.seed}'
-    args.name = 'test'
+    args.name = f'Eye_{args.domain_source}_adapt_{args.domain_target}_lambda_{args.lam}_batchsize_{args.batch_size}_{args.contrastive_mode}_{args.mode}_Cch_seed_{args.seed}'
     return args
 
 def main():
     args = parse_args()
     torch.cuda.manual_seed_all(args.seed)
-    if not os.path.exists(f'./output/{args.name}'):
-        os.mkdir(f'./output/{args.name}')
-    if not os.path.exists(f'./models/{args.name}'):
-        os.mkdir(f'./models/{args.name}')
-    with open('models/%s/args.txt' %args.name, 'w') as f:
+    if not os.path.exists(f'../output/{args.name}'):
+        os.mkdir(f'../output/{args.name}')
+    if not os.path.exists(f'../models/{args.name}'):
+        os.mkdir(f'../models/{args.name}')
+    with open('../models/%s/args.txt' %args.name, 'w') as f:
         for arg in vars(args):
             print('%s: %s' %(arg, getattr(args, arg)), file=f)
     cudnn.benchmark = True

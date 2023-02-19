@@ -28,9 +28,9 @@ class SegCLR(object):
         self.args = args
         self.device = torch.device(args.device)
         if self.args.contrastive_mode == 'inter_domain':
-            self.nt_xent_loss = NTXentLoss(self.device, 2 * self.args.batch_size, self.args.temperature, use_cosine_similarity=True)
+            self.nt_xent_loss = NTXentLoss(self.device, 2 * self.args.batch_size, self.args.temperature, use_cosine_similarity=True, con_type=self.args.con_type)
         else:
-            self.nt_xent_loss = NTXentLoss(self.device, self.args.batch_size, self.args.temperature, use_cosine_similarity=True)
+            self.nt_xent_loss = NTXentLoss(self.device, self.args.batch_size, self.args.temperature, use_cosine_similarity=True, con_type=self.args.con_type)
 
     def calculate_contrast_loss(self, model, x1, x2):
         z1 = model(x1, only_encoder=True)

@@ -4,11 +4,12 @@ import numpy as np
 
 class NTXentLoss(torch.nn.Module):
 
-    def __init__(self, device, batch_size, temperature, use_cosine_similarity):
+    def __init__(self, device, batch_size, temperature, use_cosine_similarity, con_type):
         super(NTXentLoss, self).__init__()
         self.batch_size = batch_size
         self.temperature = temperature
         self.device = device
+        self.con_type = con_type
         self.softmax = torch.nn.Softmax(dim=-1)
         self.similarity_function = self._get_similarity_function(use_cosine_similarity)
         self.criterion = torch.nn.CrossEntropyLoss(reduction="sum") # sum all 2N terms of loss instead of getting mean val
@@ -66,12 +67,17 @@ class NTXentLoss(torch.nn.Module):
 
         # labels are all 0, meaning the first value of each vector is the nominator term of CELoss
         # each denominator contains 2N+1-2 = 2N-1 terms, corresponding to all similarities between the sample and other samples.
-        labels = torch.zeros(2 * self.batch_size).to(self.device).long() 
-        loss = self.criterion(logits, labels)
+        if self.con_type == 'CL':
+            labels = torch.zeros(2 * self.batch_size).to(self.device).long() 
+            loss = self.criterion(logits, labels)
+        elif self.con_type == 'proposed_1':
+            loss = torch.sum(-torch.log(torch.exp(logits[:, 0]) / torch.sum(torch.exp(logits), dim=1)))
+            # not gonna work
+        elif self.con_type == 'proposed_2':
+            loss = torch.sum(-(logits[:, 0] - torch.sum(logits, dim=1)))
+        elif self.con_type == 'proposed_3':
+            loss = torch.sum(-torch.log(torch.exp(logits[:, 0])))
 
-        
-        
-        # weight_pos = 5
         return loss / (2 * self.batch_size) # Don't know why it is divided by 2N, the CELoss can set directly to reduction='mean'
         # positives = torch.exp(positives / self.temperature)
 

@@ -42,10 +42,10 @@ def parse_args():
     parser.add_argument('--seed', type=int, default=1) # seed
     parser.add_argument('--path', default='../..')
     parser.add_argument('--lam', default=10000, type=int) # lambda 
-
+    parser.add_argument('--CL_type', default='CL')
     parser.add_argument('--device', default='cuda:0')
     parser.add_argument('--mode', default='aug')
-    parser.add_argument('--contrastive_mode', default='only_source_domain') # con mode
+    parser.add_argument('--contrastive_mode', default='within_domain') # con mode
     args = parser.parse_args()
     args.name = f'Eye_{args.domain_source}_adapt_{args.domain_target}_lambda_{args.lam}_batchsize_{args.batch_size}_{args.contrastive_mode}_{args.mode}_Cch_seed_{args.seed}'
     return args

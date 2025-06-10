@@ -1,6 +1,10 @@
 import torch
+import sys
+sys.path.insert(1, '..')
 from loss.nt_xent import NTXentLoss
 import torch.nn.functional as F
+import sys
+sys.path.insert(1, '..')
 from loss.BCEDiceLoss import BCEDiceLoss
 from unet import Unet_SimCLR, Encoder_SimCLR, Unet
 from tqdm import tqdm
@@ -59,10 +63,10 @@ class SimCLR(object):
         additional_targets = {'t1': 'image', 't1ce': 'image', 't2': 'image', 'tumorCore': 'mask', 'enhancingTumor': 'mask'}
         )
 
-        train_source_paths = glob(f'/home/lingkai/lingkai/braTS20/{self.args.domain_source}/Train/*')
-        val_source_paths = glob(f'/home/lingkai/lingkai/braTS20/{self.args.domain_source}/Val/*')
+        train_source_paths = glob(f'/mnt/asgard2/data/lingkai/braTS20/{self.args.domain_source}/Train/*')
+        val_source_paths = glob(f'/mnt/asgard2/data/lingkai/braTS20/{self.args.domain_source}/Val/*')
         # val_source_paths = np.append(train_source_paths, val_source_paths)
-        train_target_paths = glob(f'/home/lingkai/lingkai/braTS20/{self.args.domain_target}/All/*')
+        train_target_paths = glob(f'/mnt/asgard2/data/lingkai/braTS20/{self.args.domain_target}/All/*')
         val_target_paths = train_target_paths
 
         train_source_dataset = BratsTrainContrastDataset(train_source_paths, augmentation=train_transform)

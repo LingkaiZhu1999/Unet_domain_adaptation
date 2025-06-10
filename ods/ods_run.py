@@ -10,7 +10,7 @@ def parse_args():
     parser.add_argument('--name', default='', help='model name: (default: arch+timestamp')
     parser.add_argument('--domain_source', default="refuge",
                         help='source dataset name') # source
-    parser.add_argument('--domain_target', default="rimone",
+    parser.add_argument('--domain_target', default="idrid",
                         help='target dataset name') # target 
     parser.add_argument('--input_channel', default=3, type=int, help='input channels')
     parser.add_argument('--output_channel', default=1, type=int, help='input channels')
@@ -40,14 +40,14 @@ def parse_args():
     parser.add_argument('--temperature', default=0.5, type=float)
     parser.add_argument('--validate_frequency', default=1, type=int)
     parser.add_argument('--seed', type=int, default=1) # seed
-    parser.add_argument('--path', default='../..')
-    parser.add_argument('--lam', default=10000, type=int) # lambda 
-    parser.add_argument('--CL_type', default='CL')
+    parser.add_argument('--path', default='/mnt/asgard2/data/lingkai')
+    parser.add_argument('--lam', default=1000, type=int) # lambda 
+    parser.add_argument('--CL_type', default='proposed_2')
     parser.add_argument('--device', default='cuda:0')
     parser.add_argument('--mode', default='aug')
     parser.add_argument('--contrastive_mode', default='within_domain') # con mode
     args = parser.parse_args()
-    args.name = f'Eye_{args.domain_source}_adapt_{args.domain_target}_lambda_{args.lam}_batchsize_{args.batch_size}_{args.contrastive_mode}_{args.mode}_Cch_seed_{args.seed}'
+    args.name = f'Eye_{args.domain_source}_adapt_{args.domain_target}_lambda_{args.lam}_batchsize_{args.batch_size}_{args.contrastive_mode}_CL_{args.CL_type}_{args.mode}_Cch_seed_{args.seed}'
     return args
 
 def main():

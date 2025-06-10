@@ -4,9 +4,10 @@ import torch
 from glob import glob
 from ods_sup_train_dataloader import ImageDataset
 from tqdm import tqdm
-from metrics import dice_coef
 import numpy as np
 import pickle
+import sys
+sys.path.insert(1, '/home/lingkai/lingkai/simCLR_unet_brats')
 from metrics import Dice
 torch.set_printoptions(threshold=10000)
 import argparse
@@ -16,7 +17,7 @@ import cv2
 def parse_args():
     parser = argparse.ArgumentParser()
 
-    parser.add_argument('--name', default='Eye_refuge_adapt_rimone_lambda_1000_batchsize_8_within_domain_aug_Cch_seed_1', help='model name: (default: arch+timestamp')
+    parser.add_argument('--name', default='Eye_refuge_adapt_rimone_lambda_10000_batchsize_8_only_source_domain_aug_Cch_seed_1', help='model name: (default: arch+timestamp')
     parser.add_argument('--dataset', default="rimone",
                         help='dataset name')
     parser.add_argument('--mode', default='test', type=str, help='train/val/test')
@@ -26,6 +27,7 @@ def parse_args():
                         metavar='N', help='mini-batch size (default: 16)')
     parser.add_argument('--device', default='cuda:0')
     parser.add_argument('--fine_tuning', default=False, type=bool)
+    parser.add_argument('--path', default='../..')
     # add warm up
     parser.add_argument('--seed', default=1)
     args = parser.parse_args()
@@ -50,7 +52,7 @@ def main(args):
         resize_transform = None
     torch.cuda.manual_seed_all(args.seed)
     model = U_Net(in_channels=args.input_channel, classes=args.output_channel).to(args.device)
-    state_dict = torch.load(f'models/{args.name}/{model_name}') 
+    state_dict = torch.load(f'../models/{args.name}/{model_name}') 
     keys = []
     for k, v in state_dict.items():
         if k.startswith('projector'):
@@ -60,7 +62,7 @@ def main(args):
     model.load_state_dict(state_dict)
     model = model.to(args.device)
 
-    test_dataset =  ImageDataset(dataset=args.dataset, image_path=f'../{args.dataset}/crop/images/', mask_path=f'../{args.dataset}/crop/masks/', mode='test', split_path=f'../{args.dataset}/{args.dataset}_split.csv', test=True, augmentation=resize_transform)
+    test_dataset =  ImageDataset(dataset=args.dataset, image_path=f'{args.path}/{args.dataset}/crop/images/', mask_path=f'{args.path}/{args.dataset}/crop/masks/', mode='test', split_path=f'{args.path}/{args.dataset}/{args.dataset}_split.csv', test=True, augmentation=resize_transform)
     test_loader = torch.utils.data.DataLoader(
         test_dataset,
         batch_size=1,

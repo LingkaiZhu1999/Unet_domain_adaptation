@@ -8,9 +8,9 @@ def parse_args():
     parser = argparse.ArgumentParser()
 
     parser.add_argument('--name', default='', help='model name: (default: arch+timestamp')
-    parser.add_argument('--domain_source', default="LGG",
+    parser.add_argument('--domain_source', default="BraTS19_CBICA_HGG",
                         help='source dataset name') # source
-    parser.add_argument('--domain_target', default="HGG",
+    parser.add_argument('--domain_target', default="BraTS17_TCIA_HGG",
                         help='target dataset name') # target 
     parser.add_argument('--input_channel', default=4, type=int, help='input channels')
     parser.add_argument('--output_channel', default=3, type=int, help='input channels')
@@ -50,11 +50,11 @@ def parse_args():
 def main():
     args = parse_args()
     torch.cuda.manual_seed_all(args.seed)
-    if not os.path.exists(f'./output/{args.name}'):
-        os.mkdir(f'./output/{args.name}')
-    if not os.path.exists(f'./models/{args.name}'):
-        os.mkdir(f'./models/{args.name}')
-    with open('models/%s/args.txt' %args.name, 'w') as f:
+    if not os.path.exists(f'../output/{args.name}'):
+        os.mkdir(f'../output/{args.name}')
+    if not os.path.exists(f'../models/{args.name}'):
+        os.mkdir(f'../models/{args.name}')
+    with open('../models/%s/args.txt' %args.name, 'w') as f:
         for arg in vars(args):
             print('%s: %s' %(arg, getattr(args, arg)), file=f)
     cudnn.benchmark = True

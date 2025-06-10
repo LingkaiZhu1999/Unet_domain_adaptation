@@ -1,13 +1,13 @@
 import torch
 import sys
-sys.path.insert(1, '/home/lingkai/lingkai/simCLR_unet_brats/loss')
+sys.path.insert(1, '/mnt/asgard2/code/lingkai/simCLR_unet_brats/loss')
 from nt_xent import NTXentLoss
 import torch.nn.functional as F
 # from loss.BCEDiceLoss import BCEDiceLoss
 from ods_unet import SegCLR_U_Net
 from tqdm import tqdm
 import time
-sys.path.insert(1, '/home/lingkai/lingkai/simCLR_unet_brats')
+sys.path.insert(1, '/mnt/asgard2/code/lingkai/simCLR_unet_brats')
 from utils import draw_training, draw_training_loss, draw_training_joint_on_source
 from metrics import compute_dice, Dice, AverageLoss
 from ods_dataloader import ImageDataset
@@ -28,9 +28,9 @@ class SegCLR(object):
         self.args = args
         self.device = torch.device(args.device)
         if self.args.contrastive_mode == 'inter_domain':
-            self.nt_xent_loss = NTXentLoss(self.device, 2 * self.args.batch_size, self.args.temperature, use_cosine_similarity=True, con_type=self.args.con_type)
+            self.nt_xent_loss = NTXentLoss(self.device, 2 * self.args.batch_size, self.args.temperature, use_cosine_similarity=True, con_type=self.args.CL_type)
         else:
-            self.nt_xent_loss = NTXentLoss(self.device, self.args.batch_size, self.args.temperature, use_cosine_similarity=True, con_type=self.args.con_type)
+            self.nt_xent_loss = NTXentLoss(self.device, self.args.batch_size, self.args.temperature, use_cosine_similarity=True, con_type=self.args.CL_type)
 
     def calculate_contrast_loss(self, model, x1, x2):
         z1 = model(x1, only_encoder=True)

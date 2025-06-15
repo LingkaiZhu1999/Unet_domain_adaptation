@@ -16,10 +16,10 @@ import albumentations as A
 import os
 import numpy as np
 from utils import draw_training, draw_training_loss, draw_training_joint_on_source
-import pickle
-import random 
 from torch.cuda.amp.grad_scaler import GradScaler
 import pandas as pd
+import torchvision.transforms as T
+from torchvision.transforms import functional as F
 from torch.utils.tensorboard import SummaryWriter
 
 def weights_init_kaiming(m):
@@ -50,15 +50,17 @@ class SimCLR(object):
         print(self.args.contrastive_mode)
         writer = SummaryWriter(log_dir=f'./models/{self.args.name}')
 
+        # Pa in the paper
         train_transform = A.Compose([
-        # A.RandomCrop(160, 160, always_apply=True), # decrease performance
-        # A.CenterCrop(160, 160, always_apply=True),
-        A.VerticalFlip(p=0.5),
-        A.Affine(scale=(1.0, 1.5), p=0.5),
-        A.Affine(translate_percent=(0, 0.25), p=0.5),
-        # A.CropNonEmptyMaskIfExists(width=120, height=120),
-        A.ColorJitter(brightness=0.6),
-        # A.Resize(160, 160, always_apply=True)
+        A.RandomResizedCrop(height=160, width=160, scale=(0.5, 1.0), p=1.0),
+        A.HorizontalFlip(p=0.5),
+        A.OneOf([
+            A.Compose([
+                A.ToRGB(p=1.0),
+                A.ColorJitter(brightness=0.6, contrast=0.2, p=1.0),
+                A.ToGray(p=1.0),
+            ])
+        ], p=0.8),
         ],
         additional_targets = {'t1': 'image', 't1ce': 'image', 't2': 'image', 'tumorCore': 'mask', 'enhancingTumor': 'mask'}
         )
@@ -68,7 +70,7 @@ class SimCLR(object):
         # val_source_paths = np.append(train_source_paths, val_source_paths)
         train_target_paths = glob(f'/mnt/asgard2/data/lingkai/braTS20/{self.args.domain_target}/All/*')
         val_target_paths = train_target_paths
-
+        # load seperately source and target domain datasets
         train_source_dataset = BratsTrainContrastDataset(train_source_paths, augmentation=train_transform)
         train_target_dataset = BratsTrainContrastDataset(train_target_paths, augmentation=train_transform)
 
@@ -116,7 +118,8 @@ class SimCLR(object):
                 image_source2 = image_source2.to(self.device)
                 label_source1 = label_source1.to(self.device)
 
-                image_target1, image_target2, label_target1, label_target2 = next(iter(train_target_loader))
+                # the target domain label is not used in the training
+                image_target1, image_target2, _, _ = next(iter(train_target_loader)) 
                 image_target1 = image_target1.to(self.device)
                 image_target2 = image_target2.to(self.device)
                 with torch.autocast(device_type='cuda', dtype=torch.float16):

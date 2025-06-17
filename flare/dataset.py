@@ -72,12 +72,12 @@ class FlareSliceDataset(Dataset):
             return (image - mean)
         return (image - mean) / std
 
-    # def _resize_slice(self, image, label):
-    #     """ Resizes a 2D slice and its corresponding label. """
-    #     # Use INTER_LINEAR for the image and INTER_NEAREST for the label mask
-    #     resized_image = cv2.resize(image, self.output_size, interpolation=cv2.INTER_LINEAR)
-    #     resized_label = cv2.resize(label, self.output_size, interpolation=cv2.INTER_NEAREST)
-    #     return resized_image, resized_label
+    def _resize_slice(self, image, label):
+        """ Resizes a 2D slice and its corresponding label. """
+        # Use INTER_LINEAR for the image and INTER_NEAREST for the label mask
+        resized_image = cv2.resize(image, self.output_size, interpolation=cv2.INTER_LINEAR)
+        resized_label = cv2.resize(label, self.output_size, interpolation=cv2.INTER_NEAREST)
+        return resized_image, resized_label
 
     def __getitem__(self, idx):
         item = self.hf_dataset[idx]
@@ -124,6 +124,9 @@ class FlareSliceDataset(Dataset):
             start_w = (w - target_w) // 2
             image_2d = image_2d[start_h:start_h + target_h, start_w:start_w + target_w]
             label_2d = label_2d[start_h:start_h + target_h, start_w:start_w + target_w]
+        elif h < target_h or w < target_w:
+            # Resize the image and label to the target size
+            image_2d, label_2d = self._resize_slice(image_2d, label_2d)
 
         # --- Data Augmentation ---
         if self.augmentation is not None:

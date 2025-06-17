@@ -23,7 +23,7 @@ def parse_args():
                         help='number of total epochs to run')
     parser.add_argument('--early-stop', default=20, type=int,
                         metavar='N', help='early stopping patience (default: 20)')
-    parser.add_argument('-b', '--batch-size', default=8, type=int,
+    parser.add_argument('-b', '--batch-size', default=2, type=int,
                         metavar='N', help='mini-batch size (default: 8)')
     parser.add_argument('--optimizer', default='Adam', choices=['Adam', 'SGD'],
                         help='optimizer type (default: Adam)')

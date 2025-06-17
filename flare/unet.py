@@ -66,11 +66,11 @@ class Projector_CH_1(nn.Module):
         self.relu = nn.ReLU()
         self.projector_layer = nn.Sequential(
             Flatten(),
-            nn.Linear(10*10, 64),
+            nn.Linear(1024, 128),
             nn.ReLU(),
-            nn.Linear(64, 64),
-            nn.ReLU(),
-            nn.Linear(64, 64)
+            nn.Linear(128, 128),
+            # nn.ReLU(),
+            # nn.Linear(64, 64)
             )
 
         ###worse performance ###

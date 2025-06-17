@@ -32,7 +32,7 @@ class SegCLR_FLARE:
         # --- 1. Define Augmentations ---
         # Simplified for single-channel images
         train_transform = A.Compose([
-        A.RandomResizedCrop(height=512, width=512, scale=(0.5, 1.0), p=1.0),    # MRI size is 512x512 PET size is 400x400
+        A.RandomResizedCrop(height=256, width=256, scale=(0.5, 1.0), p=1.0),    # MRI size is 512x512 PET size is 400x400
         A.HorizontalFlip(p=0.5),
         A.OneOf([
             A.Compose([
@@ -43,6 +43,7 @@ class SegCLR_FLARE:
         ], p=0.8),
         ],
         )
+        train_transform = None
 
         # --- 2. Load Datasets using the FLARE Loader ---
         print("--- Loading FLARE Datasets ---")

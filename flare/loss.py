@@ -9,21 +9,21 @@ class MultiClassDiceCELoss(nn.Module):
     """
     Combination of Dice Loss and Cross Entropy Loss for multi-class segmentation.
     """
-    def __init__(self, num_classes, weight_ce=1.0, weight_dice=1.0):
+    def __init__(self, num_classes, weight_ce=1.0, weight_dice=2.0):
         super(MultiClassDiceCELoss, self).__init__()
         self.weight_ce = weight_ce
         self.weight_dice = weight_dice
         self.ce_loss = nn.CrossEntropyLoss()
-        self.dice_loss = DiceLoss(to_onehot_y=True, softmax=True)
+        self.dice_loss = DiceLoss(sigmoid=True, batch=True)
         self.num_classes = num_classes
 
     def forward(self, inputs, targets):
         # inputs shape: (B, C, H, W), targets shape: (B, H, W)
-        ce_val = self.ce_loss(inputs, targets)
+        ce_val = self.ce_loss(inputs, targets)  # targets should be of shape (B, H, W) for CrossEntropyLoss
         
         # DiceLoss from MONAI expects inputs to be softmaxed and targets to be one-hot
         # The DiceLoss implementation handles this internally with softmax=True and to_onehot_y=True
-        dice_val = self.dice_loss(inputs, targets.unsqueeze(1))
+        dice_val = self.dice_loss(inputs, targets)
         
         return self.weight_ce * ce_val + self.weight_dice * dice_val
     

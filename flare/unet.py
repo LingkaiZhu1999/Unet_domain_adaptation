@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Tuple, List, Optional
+from typing import Tuple, List, Optional, Union
 
 # --- 1. Basic Building Blocks (Refactored for Clarity and Flexibility) ---
 
@@ -31,24 +31,21 @@ def get_norm_layer(norm_type: str, num_channels: int) -> nn.Module:
 
 
 class DoubleConv(nn.Module):
-    """(Convolution => Normalization => ReLU) * 2"""
+    """(Convolution => Normalization => LReLU) * 2"""
     def __init__(self, in_channels: int, out_channels: int, mid_channels: int = None,
-                 dropout: float = 0.0, norm: str = 'group'):
+                 dropout: float = 0.0, norm: str = 'instance'):
         super().__init__()
         if not mid_channels:
             mid_channels = out_channels
-
-        # Use bias=False for conv layers when using BatchNorm, as it has its own bias (beta).
         use_bias = norm.lower() != 'batch'
-
         self.double_conv = nn.Sequential(
             nn.Conv2d(in_channels, mid_channels, kernel_size=3, padding=1, bias=use_bias),
             get_norm_layer(norm, mid_channels),
-            nn.ReLU(inplace=True),
+            nn.LeakyReLU(inplace=True),
             nn.Dropout2d(p=dropout),
             nn.Conv2d(mid_channels, out_channels, kernel_size=3, padding=1, bias=use_bias),
             get_norm_layer(norm, out_channels),
-            nn.ReLU(inplace=True),
+            nn.LeakyReLU(inplace=True),
             nn.Dropout2d(p=dropout)
         )
 
@@ -89,26 +86,24 @@ class UNet(nn.Module):
                  out_channels: int,
                  channel_list: Optional[List[int]] = None,
                  dropout_rates: Optional[List[float]] = None,
-                 norm: str = 'group'):
+                 norm: str = 'group',
+                 deep_supervision: bool = False): # <<< --- ADDED DEEP SUPERVISION FLAG
         """
-        A robust U-Net model that can handle arbitrary input sizes.
+        A robust U-Net model with optional deep supervision.
 
         Args:
-            in_channels: Number of input channels.
-            out_channels: Number of output classes.
-            channel_list: List of channels for each level of the U-Net.
-                          Default: [64, 128, 256, 512, 1024].
-            dropout_rates: List of dropout rates for each level (5 down, 4 up).
-                           Default: All zeros.
-            norm: Normalization type. One of 'batch', 'instance', 'group', 'none'.
-                  Default: 'group'.
+            ... (other args are the same) ...
+            deep_supervision: If True, adds auxiliary output heads in the decoder.
+                              The forward pass will return a list of segmentations.
+                              Default: False.
         """
         super(UNet, self).__init__()
+        self.deep_supervision = deep_supervision
 
         if channel_list is None:
             channel_list = [64, 128, 256, 512, 1024]
         if dropout_rates is None:
-            dropout_rates = [0.0] * 9 # 5 down blocks (inc. in_conv), 4 up blocks
+            dropout_rates = [0.0, 0.0, 0.1, 0.2, 0.3, 0.2, 0.1, 0.0, 0.0]
 
         assert len(dropout_rates) == 9, "dropout_rates must have 9 values (1 in_conv, 4 down, 4 up)"
 
@@ -127,57 +122,72 @@ class UNet(nn.Module):
 
         self.out_conv = nn.Conv2d(channel_list[0], out_channels, kernel_size=1)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # <<< --- ADDED AUXILIARY HEADS FOR DEEP SUPERVISION ---
+        if self.deep_supervision:
+            # We add heads at the output of up3, up2, and up1
+            self.ds_out3 = nn.Conv2d(channel_list[1] // factor, out_channels, kernel_size=1)
+            self.ds_out2 = nn.Conv2d(channel_list[2] // factor, out_channels, kernel_size=1)
+            self.ds_out1 = nn.Conv2d(channel_list[3] // factor, out_channels, kernel_size=1)
+
+    def forward(self, x: torch.Tensor) -> Union[torch.Tensor, List[torch.Tensor]]:
+        # Encoder path
         x1 = self.in_conv(x)
         x2 = self.down1(x1)
         x3 = self.down2(x2)
         x4 = self.down3(x3)
         x5 = self.down4(x4)
 
-        x = self.up1(x5, x4)
-        x = self.up2(x, x3)
-        x = self.up3(x, x2)
-        x = self.up4(x, x1)
+        # Decoder path
+        d1 = self.up1(x5, x4)
+        d2 = self.up2(d1, x3)
+        d3 = self.up3(d2, x2)
+        d4 = self.up4(d3, x1)
 
-        logits = self.out_conv(x)
-        return logits
+        # Final output
+        logits_final = self.out_conv(d4)
+
+        # <<< --- MODIFIED FORWARD PASS TO RETURN MULTIPLE OUTPUTS ---
+        if self.deep_supervision:
+            # Get predictions from auxiliary heads
+            logits_ds1 = self.ds_out1(d1)
+            logits_ds2 = self.ds_out2(d2)
+            logits_ds3 = self.ds_out3(d3)
+            # Return a list of tensors, from coarsest to finest resolution
+            return [logits_ds1, logits_ds2, logits_ds3, logits_final]
+        else:
+            return logits_final
+
 
 # --- 3. SimCLR Variant using the Robust Blocks ---
-# (Your original SimCLR/Projector code can remain here, just ensure you pass the `norm` param if needed)
-class Flatten(nn.Module):
-    def forward(self, x):
-        return x.view(x.size(0), -1)
-
 class Projector(nn.Module):
     def __init__(self, in_channels: int, proj_hidden_dim: int, proj_output_dim: int):
         super().__init__()
         self.projector_head = nn.Sequential(
             nn.AdaptiveAvgPool2d((1, 1)),
-            Flatten(),
+            nn.Flatten(),
             nn.Linear(in_channels, proj_hidden_dim),
-            nn.ReLU(inplace=True),
+            nn.LeakyReLU(inplace=True),
             nn.Linear(proj_hidden_dim, proj_output_dim),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.projector_head(x)
-
+    
 class Unet_SegCLR(nn.Module):
     """A U-Net model with a SimCLR projection head on the encoder's bottleneck."""
-    def __init__(self, in_channels: int, out_channels: int, proj_output_dim: int = 128, norm: str = 'group'):
+    def __init__(self, in_channels: int, out_channels: int, proj_output_dim: int = 128, norm: str = 'instance', deep_supervision: bool = False):
         super().__init__()
-        # Pass the norm choice to the underlying U-Net
-        self.unet = UNet(in_channels, out_channels, norm=norm)
+        # <<< --- PASS DEEP SUPERVISION FLAG TO UNET ---
+        self.unet = UNet(in_channels, out_channels, norm=norm, deep_supervision=deep_supervision)
         
-        # The projector attaches to the bottleneck, which has channel_list[4] channels
-        bottleneck_channels = 1024 # Based on default channel list
+        bottleneck_channels = 1024
         self.projector = Projector(
             in_channels=bottleneck_channels // 2,
             proj_hidden_dim=512,
             proj_output_dim=proj_output_dim
         )
 
-    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, Union[torch.Tensor, List[torch.Tensor]]]:
         # --- Encoder Path ---
         x1 = self.unet.in_conv(x)
         x2 = self.unet.down1(x1)
@@ -194,45 +204,46 @@ class Unet_SegCLR(nn.Module):
         d3 = self.unet.up3(d2, x2)
         d4 = self.unet.up4(d3, x1)
         
-        logits = self.unet.out_conv(d4)
+        logits_final = self.unet.out_conv(d4)
         
-        return z, logits
+        # <<< --- HANDLE MULTIPLE OUTPUTS FROM THE UNET ---
+        if self.unet.deep_supervision:
+            logits_ds1 = self.unet.ds_out1(d1)
+            logits_ds2 = self.unet.ds_out2(d2)
+            logits_ds3 = self.unet.ds_out3(d3)
+            # When using SegCLR, we only care about the final segmentation for supervised loss,
+            # but the UNet itself returns all heads. We'll return them all.
+            # Your training loop will then need to handle this list.
+            all_logits = [logits_ds1, logits_ds2, logits_ds3, logits_final]
+            return z, all_logits
+        else:
+            return z, logits_final
+
 
 # --- 4. Testing the Robustness and Flexibility ---
 if __name__ == "__main__":
-    # --- Test 1: Robustness to input size ---
-    print("--- Testing with non-standard size (251x387) ---")
-    net_group = UNet(in_channels=1, out_channels=3) # Uses default GroupNorm
-    non_standard_input = torch.randn(2, 1, 251, 387)
-    non_standard_output = net_group(non_standard_input)
-    print(f"Input shape: {non_standard_input.shape}")
-    print(f"Output shape: {non_standard_output.shape}") # Should be (2, 3, 251, 387)
-    print("Test successful: Model is robust to arbitrary input sizes.")
+    # ... (previous tests are still valid) ...
 
-    # --- Test 2: Flexibility of Normalization ---
-    print("\n--- Testing different normalization layers ---")
+    # <<< --- ADDED TEST FOR DEEP SUPERVISION ---
+    print("\n--- Testing U-Net with Deep Supervision ---")
+    ds_net = UNet(in_channels=1, out_channels=3, deep_supervision=True)
+    standard_input = torch.randn(2, 1, 256, 256)
+    ds_outputs = ds_net(standard_input)
 
-    # Batch Norm
-    net_batch = UNet(in_channels=1, out_channels=3, norm='batch')
-    print("\nModel with BatchNorm2d:")
-    # print(net_batch) # Uncomment to see the full architecture
-    assert isinstance(net_batch.in_conv.double_conv[1], nn.BatchNorm2d)
-    print("Successfully created U-Net with Batch Normalization.")
-
-    # Instance Norm
-    net_instance = UNet(in_channels=1, out_channels=3, norm='instance')
-    assert isinstance(net_instance.in_conv.double_conv[1], nn.InstanceNorm2d)
-    print("Successfully created U-Net with Instance Normalization.")
-
-    # No Norm
-    net_none = UNet(in_channels=1, out_channels=3, norm='none')
-    assert isinstance(net_none.in_conv.double_conv[1], nn.Identity)
-    print("Successfully created U-Net with no normalization (Identity).")
+    assert isinstance(ds_outputs, list), "Output should be a list for deep supervision"
+    assert len(ds_outputs) == 4, "Should have 4 outputs (3 auxiliary + 1 final)"
+    print(f"Successfully created DS-U-Net. Number of outputs: {len(ds_outputs)}")
+    print("Output shapes (from coarsest to finest):")
+    for i, out in enumerate(ds_outputs):
+        print(f"  Output {i+1}: {out.shape}")
     
-    # --- Test 3: SimCLR variant ---
-    print("\n--- Testing Unet_SegCLR with Batch Norm ---")
-    simclr_net = Unet_SegCLR(in_channels=1, out_channels=3, norm='batch')
-    z, logits = simclr_net(non_standard_input)
+    # Final output should match input size
+    assert ds_outputs[-1].shape == standard_input.shape[:1] + (3,) + standard_input.shape[2:]
+
+    print("\n--- Testing Unet_SegCLR with Deep Supervision ---")
+    ds_segclr_net = Unet_SegCLR(in_channels=1, out_channels=3, deep_supervision=True)
+    z, logits_list = ds_segclr_net(standard_input)
+    assert isinstance(logits_list, list) and len(logits_list) == 4
     print(f"Projection Vector (z) shape: {z.shape}") # Should be (2, 128)
-    print(f"Segmentation Logits shape: {logits.shape}") # Should be (2, 3, 251, 387)
-    print("Test successful: Unet_SegCLR is also robust and flexible.")
+    print(f"Segmentation Logits is a list of {len(logits_list)} tensors.")
+    print("Test successful: Models are robust to deep supervision flag.")

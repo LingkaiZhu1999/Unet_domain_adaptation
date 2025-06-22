@@ -1,193 +1,276 @@
-import sys
-import torch
-import torch.nn.functional as F
-from torch.utils.data import DataLoader, ConcatDataset
-from datasets import load_dataset
-from tqdm import tqdm
-import time
-import os
-import numpy as np
-import pandas as pd
-from torch.cuda.amp.grad_scaler import GradScaler
-from torch.utils.tensorboard import SummaryWriter
-import albumentations as A
+# File: segclr_train.py
+import argparse
+from collections import OrderedDict
+from pathlib import Path
 from itertools import cycle
 
-# --- Project-specific imports ---
-from unet import Unet_SegCLR  # Assumes this model exists and is adaptable
-from loss import NTXentLoss
-from loss import MultiClassDiceCELoss
-from metrics import AverageMeter
-from dataset import FlareSliceDataset, NiftiDataset # Use our new dataset class
+import torch
+import torch.backends.cudnn as cudnn
+import torch.optim as optim
+import torch.nn.functional as F
 from monai.metrics import DiceMetric
+from monai.transforms import Compose, AsDiscrete
+from monai.data import DataLoader, PersistentDataset, pad_list_data_collate, CacheDataset
+from monai.data import decollate_batch
+from torch.amp import GradScaler, autocast
+from torch.utils.tensorboard import SummaryWriter
+from tqdm import tqdm
+import wandb
 
-class SegCLR_FLARE:
-    def __init__(self, args):
-        self.args = args
-        self.device = torch.device(args.device)
-        self.nt_xent_loss = NTXentLoss(self.device, 2 * self.args.batch_size, self.args.temperature, use_cosine_similarity=True)
-        self.writer = SummaryWriter(log_dir=f'./models/{self.args.name}')
+# --- Project-specific imports ---
+from datasets import load_dataset, concatenate_datasets
+from loss import MultiClassDiceCELoss, NTXentLoss
+from metrics import AverageMeter
+from unet import Unet_SegCLR # The model that outputs features and logits
+from utils import save_validation_results
 
-    def joint_train_on_source_and_target(self):
-        # --- 1. Define Augmentations ---
-        # Simplified for single-channel images
-        train_transform = A.Compose([
-        A.RandomResizedCrop(height=256, width=256, scale=(0.5, 1.0), p=1.0),    # MRI size is 512x512 PET size is 400x400
-        A.HorizontalFlip(p=0.5),
-        A.OneOf([
-            A.Compose([
-                A.ToRGB(p=1.0),
-                A.ColorJitter(brightness=0.6, contrast=0.2, p=1.0),
-                A.ToGray(p=1.0),
-            ])
-        ], p=0.8),
-        ],
-        )
-        train_transform = None
+# --- 1. Argument Parsing (Combined from both scripts) ---
 
-        # --- 2. Load Datasets using the FLARE Loader ---
-        print("--- Loading FLARE Datasets ---")
-        LOCAL_DATASET_PATH = "/mnt/asgard6/data/FLARE-MedFM/FLARE-Task3-DomainAdaption"
+def parse_args():
+    parser = argparse.ArgumentParser(description="SegCLR Training for Domain Adaptation")
+    # --- Data and Model ---
+    parser.add_argument('--name', default='', help='Experiment name')
+    parser.add_argument('--data_dir', type=Path, required=True, help='Root FLARE dataset directory')
+    parser.add_argument('--cache_dir', type=Path, default='./.monai_cache', help='Directory for MONAI PersistentDataset cache')
+    parser.add_argument('--source_domain1', default="train_ct_gt", help='Labeled source domain')
+    parser.add_argument('--source_domain2', default="train_ct_pseudo", help='Second labeled source domain')
+    parser.add_argument('--target_domain', default="train_mri_unlabeled", help='Unlabeled target domain')
+    parser.add_argument('--val_domain', default="validation_mri", help='Validation domain')
+    parser.add_argument('--output_channel', default=14, type=int, help='Number of output segmentation classes')
+
+    # --- Training Hyperparameters ---
+    parser.add_argument('--epochs', default=200, type=int)
+    parser.add_argument('-b', '--batch_size', default=8, type=int)
+    parser.add_argument('--lr', default=1e-4, type=float, help='Initial learning rate for AdamW')
+    parser.add_argument('--validate_every', default=2, type=int)
+
+    # --- SegCLR Specific Hyperparameters ---
+    parser.add_argument('--lam', default=1.0, type=float, help='Weight for the supervised loss')
+    parser.add_argument('--temperature', default=0.1, type=float, help='Temperature for NT-Xent loss')
+    parser.add_argument('--contrastive_mode', default='within_domain', choices=['inter_domain', 'within_domain', 'only_target_domain'])
+
+    # --- System and Reproducibility ---
+    parser.add_argument('--device', default='cuda:0')
+    parser.add_argument('--num_workers', default=64, type=int)
+    parser.add_argument('--seed', type=int, default=42)
+    
+    args = parser.parse_args()
+    if not args.name:
+        args.name = f"SegCLR_{args.source_domain1}_{args.source_domain2}_to_{args.target_domain}_lam{args.lam}_mode_{args.contrastive_mode}"
+    return args
+
+# --- 2. Training and Validation Functions (Adapted for SegCLR) ---
+
+def train_epoch_segclr(model, source_loader, target_iterator, optimizer, sup_criterion, con_criterion, scaler, device, args):
+    model.train()
+    sup_loss_meter = AverageMeter()
+    con_loss_meter = AverageMeter()
+
+    for i, source_batch in enumerate(source_loader):
+        # --- Get data from both domains ---
+        target_batch = next(target_iterator)
         
-        # Source Domain: Labeled CT scans (GT + Pseudo)
-        hf_source_gt = load_dataset("./local_flare_loader.py", name="train_ct_gt", data_dir=LOCAL_DATASET_PATH, trust_remote_code=True)["train"]
-        hf_source_pseudo = load_dataset("./local_flare_loader.py", name="train_ct_pseudo_blackbean_flare22", data_dir=LOCAL_DATASET_PATH, trust_remote_code=True)["train"]
-        hf_source = ConcatDataset([hf_source_gt, hf_source_pseudo])
+        s_img1 = source_batch['image'].to(device, non_blocking=True)
+        s_img2 = source_batch['image2'].to(device, non_blocking=True)
+        s_label = source_batch['label'].to(device, non_blocking=True)
+        has_label = source_batch['has_label'].to(device, non_blocking=True)
+        
+        t_img1 = target_batch['image'].to(device, non_blocking=True)
+        t_img2 = target_batch['image2'].to(device, non_blocking=True)
 
-        # Target Domain: Unlabeled MRI scans
-        hf_target = load_dataset("./local_flare_loader.py", name="train_mri_unlabeled", data_dir=LOCAL_DATASET_PATH, trust_remote_code=True)["train"]
+        optimizer.zero_grad(set_to_none=True)
 
-        # Validation Set: Labeled CT for supervised metric check
-        hf_val_source = load_dataset("./local_flare_loader.py", name="validation_mri", data_dir=LOCAL_DATASET_PATH, trust_remote_code=True)["train"]
+        with autocast(device_type=device.type, dtype=torch.float16):
+            # --- Forward passes for all 4 images ---
+            zs1, logits_s1 = model(s_img1) # Supervised + Contrastive
+            zs2, _         = model(s_img2) # Contrastive only
+            zt1, _         = model(t_img1) # Contrastive only
+            zt2, _         = model(t_img2) # Contrastive only
 
-        # Create PyTorch Slice Datasets for training/contrastive validation
-        train_source_dataset = FlareSliceDataset(hf_source, augmentation=train_transform, is_contrastive=True)
-        train_target_dataset = FlareSliceDataset(hf_target, augmentation=train_transform, is_contrastive=True)
-        val_source_dataset = FlareSliceDataset(hf_val_source, augmentation=train_transform, is_contrastive=True) # For contrastive validation
-
-        # Create DataLoader for 3D validation
-        val_source_3d_dataset = NiftiDataset(hf_val_source)
-
-        # --- 3. Create DataLoaders ---
-        train_source_loader = DataLoader(train_source_dataset, batch_size=self.args.batch_size, shuffle=True, num_workers=4, pin_memory=True, drop_last=True)
-        train_target_loader = DataLoader(train_target_dataset, batch_size=self.args.batch_size, shuffle=True, num_workers=4, pin_memory=True, drop_last=True)
-        val_source_loader = DataLoader(val_source_dataset, batch_size=self.args.batch_size, shuffle=False, num_workers=4, pin_memory=True)
-        val_source_3d_loader = DataLoader(val_source_3d_dataset, batch_size=1, shuffle=False, num_workers=2, pin_memory=True)
-
-        # --- 4. Initialize Model, Loss, Optimizer ---
-        model = Unet_SegCLR(in_channel=self.args.input_channel, out_channel=self.args.output_channel).to(self.device)
-        # For multi-class segmentation (13 organs + 1 background)
-        criterion = MultiClassDiceCELoss(num_classes=self.args.output_channel).to(self.device)
-        optimizer = torch.optim.Adam(model.parameters(), self.args.lr, weight_decay=1e-4)
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=self.args.epochs, eta_min=0)
-        scaler = GradScaler(enabled=True)
-
-        # --- 5. Training Loop ---
-        best_val_dice = 0
-        trigger = 0
-        target_iterator = cycle(train_target_loader)
-
-        for epoch in range(self.args.epochs):
-            model.train()
-            sup_loss_meter = AverageMeter()
-            con_loss_meter = AverageMeter()
-
-            for i, data_source in tqdm(enumerate(train_source_loader), total=len(train_source_loader)):
-                image_source1, image_source2, label_source1, _ = data_source
-                image_target1, image_target2, _, _ = next(target_iterator)
-
-                image_source1, image_source2 = image_source1.to(self.device), image_source2.to(self.device)
-                label_source1 = label_source1.to(self.device)
-                image_target1, image_target2 = image_target1.to(self.device), image_target2.to(self.device)
-
-                optimizer.zero_grad()
-
-                with torch.autocast(device_type='cuda', dtype=torch.float16):
-                    # Forward passes
-                    z11, predict_source1 = model(image_source1)
-                    z22, _ = model(image_source2)
-                    z1, _ = model(image_target1)
-                    z2, _ = model(image_target2)
-
-                    # Supervised Loss on source domain
-                    supervise_loss = criterion(predict_source1, label_source1)
-                    
-                    # Contrastive Loss (logic adapted from your code)
-                    if self.args.contrastive_mode == 'inter_domain':
-                        z_all1 = torch.cat((z1, z11), dim=0)
-                        z_all2 = torch.cat((z2, z22), dim=0)
-                        contrast_loss = self.nt_xent_loss(F.normalize(z_all1, dim=1), F.normalize(z_all2, dim=1))
-                    elif self.args.contrastive_mode == 'within_domain':
-                        loss1 = self.nt_xent_loss(F.normalize(z1, dim=1), F.normalize(z2, dim=1))
-                        loss2 = self.nt_xent_loss(F.normalize(z11, dim=1), F.normalize(z22, dim=1))
-                        contrast_loss = 0.5 * (loss1 + loss2)
-                    else: # 'only_target_domain'
-                        contrast_loss = self.nt_xent_loss(F.normalize(z1, dim=1), F.normalize(z2, dim=1))
-
-                    total_loss = self.args.lam * supervise_loss + contrast_loss
-
-                scaler.scale(total_loss).backward()
-                scaler.step(optimizer)
-                scaler.update()
-
-                sup_loss_meter.update(supervise_loss.item(), image_source1.size(0))
-                con_loss_meter.update(contrast_loss.item(), image_source1.size(0))
-
-            print(f'Training: Epoch [{epoch+1}/{self.args.epochs}] | Sup Loss: {sup_loss_meter.avg:.4f} | Con Loss: {con_loss_meter.avg:.4f}')
-            self.writer.add_scalar("Loss/train_supervise", sup_loss_meter.avg, epoch)
-            self.writer.add_scalar("Loss/train_contrastive", con_loss_meter.avg, epoch)
+            # --- Loss Calculation ---
+            # 1. Supervised Loss (on source domain, first view)
+            if torch.any(has_label):
+                supervise_loss = sup_criterion(logits_s1[has_label], s_label[has_label])
+            else:
+                print(s_label)
+                raise ValueError("No labeled data in the current batch. Ensure your source domain has labeled samples.")
             
-            if (epoch + 1) % self.args.validate_frequency == 0:
-                # --- Validation Step ---
-                val_dice = self.validate_slice_dice(model, val_source_loader)
-                self.writer.add_scalar("Metric/val_dice_2d", val_dice, epoch)
-                print(f'Validation: Epoch [{epoch+1}/{self.args.epochs}] | 2D Slice Dice: {val_dice:.4f}')
+            # 2. Contrastive Loss (based on selected mode)
+            # zs1, zs2 = F.normalize(zs1, dim=1), F.normalize(zs2, dim=1)
+            # zt1, zt2 = F.normalize(zt1, dim=1), F.normalize(zt2, dim=1)
 
-                if val_dice > best_val_dice:
-                    best_val_dice = val_dice
-                    trigger = 0
-                    torch.save(model.state_dict(), os.path.join(f'./models/{self.args.name}', 'best_val_dice_model.pt'))
-                    print("=> Saving best model")
-                else:
-                    trigger += 1
+            if args.contrastive_mode == 'inter_domain':
+                z_all1 = torch.cat((zs1, zt1), dim=0)
+                z_all2 = torch.cat((zs2, zt2), dim=0)
+                z_all1 = F.normalize(z_all1, dim=1)
+                z_all2 = F.normalize(z_all2, dim=1)
+                contrast_loss = con_criterion(z_all1, z_all2)
+            elif args.contrastive_mode == 'within_domain':
+                zs1, zs2 = F.normalize(zs1, dim=1), F.normalize(zs2, dim=1)
+                zt1, zt2 = F.normalize(zt1, dim=1), F.normalize(zt2, dim=1)
+                # Contrastive loss for both source and target
+                loss_s = con_criterion(zs1, zs2)
+                loss_t = con_criterion(zt1, zt2)
+                contrast_loss = 0.5 * (loss_s + loss_t)
+            else: # 'only_target_domain'
+                contrast_loss = con_criterion(zt1, zt2)
+           
+            # 3. Total Loss
+            total_loss = args.lam * supervise_loss + contrast_loss
+        
+        scaler.scale(total_loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
+        
+        sup_loss_meter.update(supervise_loss.item(), s_img1.size(0))
+        con_loss_meter.update(contrast_loss.item(), t_img1.size(0))
+        
+    return OrderedDict([('sup_loss', sup_loss_meter.avg), ('con_loss', con_loss_meter.avg)])
 
-            if self.args.early_stop and trigger >= self.args.early_stop:
-                print("=> Early stopping")
-                break
+def validate_epoch(model, loader, criterion, dice_metric, device, post_trans, epoch=0):
+    model.eval()
+    dice_metric.reset()
+    loss_meter = AverageMeter()
+
+    with torch.no_grad():
+        for i, batch in enumerate(loader):
+            images = batch['image'].to(device, non_blocking=True)
+            labels = batch['label'].to(device, non_blocking=True)
+
+            with autocast(device_type=device.type, dtype=torch.float16):
+                _, outputs = model(images) # We only need the segmentation logits for validation
+                loss = criterion(outputs, labels)
+            loss_meter.update(loss.item(), images.size(0))
+
+            processed_outputs = [post_trans(output_item) for output_item in decollate_batch(outputs)]
+            dice_metric(y_pred=processed_outputs, y=decollate_batch(labels))
+    
+    val_dice_dict = dice_metric.aggregate() # aggregate() now returns a dict per class
+    # To get the mean dice across all (non-background) classes:
+    val_dice = val_dice_dict.mean().item()
+    save_validation_results(
+        images, labels, torch.stack(processed_outputs), epoch,
+        output_dir=Path('./validation_images')
+    )
+    return OrderedDict([('val_loss', loss_meter.avg), ('val_dice', val_dice),  ('val_dice_per_class', val_dice_dict.cpu().numpy()) # For detailed logging
+    ])
+
+# --- 3. Main Training Function ---
+
+def main():
+    args = parse_args()
+    wandb.login(key="3aa7107481fda070c948a0e50409228c7c142d0f")  # Replace with your actual API key
+    wandb.init(project="flare_segclr", name=args.name, config=args)
+    device = torch.device(args.device)
+
+    # --- Select appropriate 2D or 3D Dataset ---
+    # For this example, we'll hardcode the 3D dataset. You can add the 2D logic back if needed.
+    if True:
+        print("Using 2D model.")
+        from dataset import OnTheFly2DDataset as FlarePatchDataset
+        from unet import UNet as UNet # Ensure you have the correct import for your 2D model
+        PATCH_SIZE_TRAIN = (480, 480)
+        PATCH_SIZE_VAL = (240, 240)  
+
+    # --- Setup Directories and Seeds ---
+    model_dir = Path('./models') / args.name
+    model_dir.mkdir(parents=True, exist_ok=True)
+    writer = SummaryWriter(log_dir=str(model_dir))
+    
+    if args.seed is not None:
+        torch.manual_seed(args.seed)
+    cudnn.benchmark = True
+
+    # --- Data Loading using MONAI PersistentDataset ---
+    print("--- Loading & Caching Datasets ---")
+    hf_source_gt = load_dataset("./local_flare_loader.py", name=args.source_domain1, data_dir=str(args.data_dir), trust_remote_code=True)["train"]
+    hf_source_pseudo = load_dataset("./local_flare_loader.py", name=args.source_domain2, data_dir=str(args.data_dir), trust_remote_code=True)["train"]
+    hf_source = concatenate_datasets([hf_source_gt, hf_source_pseudo])  # Combine both source domains
+    # hf_source = hf_source_pseudo  # For now, we only use the ground truth source domain
+    hf_target = load_dataset("./local_flare_loader.py", name=args.target_domain, data_dir=str(args.data_dir), trust_remote_code=True)["train"]
+    hf_val = load_dataset("./local_flare_loader.py", name=args.val_domain, data_dir=str(args.data_dir), trust_remote_code=True)["train"]
+
+    # Datasets for contrastive training
+    source_dataset = FlarePatchDataset(hf_source, patch_size=PATCH_SIZE_TRAIN, is_train=True, is_contrastive=True)
+    target_dataset = FlarePatchDataset(hf_target, patch_size=PATCH_SIZE_TRAIN, is_train=True, is_contrastive=True)
+
+    # Dataset for standard validation
+    val_dataset = FlarePatchDataset(hf_val, patch_size=PATCH_SIZE_VAL, is_train=False, is_contrastive=False)
+
+    # Use PersistentDataset for massive speedup after the first run
+    # source_persistent_dataset = PersistentDataset(data=source_dataset, cache_dir=args.cache_dir / "source")
+    # target_persistent_dataset = PersistentDataset(data=target_dataset, cache_dir=args.cache_dir / "target")
+    # val_persistent_dataset = PersistentDataset(data=val_dataset, cache_dir=args.cache_dir / "val")
+    source_cached_dataset = CacheDataset(data=source_dataset, cache_rate=1., num_workers=args.num_workers)
+    target_cached_dataset = CacheDataset(data=target_dataset, cache_rate=1., num_workers=args.num_workers)
+    val_cached_dataset = CacheDataset(data=val_dataset, cache_rate=1., num_workers=args.num_workers)
+
+    # DataLoaders
+    source_loader = DataLoader(source_cached_dataset, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers, pin_memory=True, drop_last=True)
+    target_loader = DataLoader(target_cached_dataset, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers, pin_memory=True, drop_last=True)
+    val_loader = DataLoader(val_cached_dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, pin_memory=True, drop_last=False)
+    target_iterator = cycle(target_loader)
+    
+    # --- Model, Losses, Optimizer ---
+    model = Unet_SegCLR(in_channels=1, out_channels=args.output_channel).to(device)
+    # limit of compile to be 64
+    torch._dynamo.config.cache_size_limit = 64
+    model = torch.compile(model)
+    
+    sup_criterion = MultiClassDiceCELoss(num_classes=args.output_channel).to(device)
+    con_criterion = NTXentLoss(device, args.temperature, use_cosine_similarity=True)
+    
+    optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
+    scaler = GradScaler()
+    
+    # --- Validation Metrics Setup ---
+    dice_metric = DiceMetric(include_background=False, reduction="mean_batch", get_not_nans=False)
+    post_trans = Compose([AsDiscrete(argmax=True, to_onehot=args.output_channel)])
+
+    # --- Main Training Loop ---
+    best_val_dice = 0.0
+    epoch_progress = tqdm(range(1, args.epochs + 1), desc="Training Progress", unit="epoch")
+    for epoch in epoch_progress:
+        
+        train_log = train_epoch_segclr(model, source_loader, target_iterator, optimizer, sup_criterion, con_criterion, scaler, device, args)
+        epoch_progress.set_postfix({
+            'Epoch': epoch,
+            'Sup Loss': train_log['sup_loss'],
+            'Con Loss': train_log['con_loss'],
+            'LR': optimizer.param_groups[0]['lr']
+        })
+        # Log training losses
+        writer.add_scalar("Loss/Supervised", train_log['sup_loss'], epoch)
+        writer.add_scalar("Loss/Contrastive", train_log['con_loss'], epoch)
+        wandb.log({"train_sup_loss": train_log['sup_loss'], "train_con_loss": train_log['con_loss'], "epoch": epoch})
+
+        scheduler.step()
+        writer.add_scalar("Meta/LR", optimizer.param_groups[0]['lr'], epoch)
+        
+        if epoch % args.validate_every == 0 or epoch == args.epochs:
+            val_log = validate_epoch(model, val_loader, sup_criterion, dice_metric, device, post_trans, epoch)
+            epoch_progress.set_postfix({
+                'Val Dice': val_log['val_dice'],
+                'Val Loss': val_log['val_loss']
+            })
+            # Log validation metrics
+            writer.add_scalar("Dice/Validation", val_log['val_dice'], epoch)
+            writer.add_scalar("Loss/Validation", val_log['val_loss'], epoch)
+            wandb.log({"val_dice": val_log['val_dice'], "val_loss": val_log['val_loss'], "epoch": epoch})
             
-            if epoch >= self.args.warm_up:
-                scheduler.step()
-        
-        self.writer.close()
+            print(f"Validation Dice: {val_log['val_dice']:.4f} | Validation Loss: {val_log['val_loss']:.4f}")
 
-    def validate_slice_dice(self, model, val_loader):
-        """ Validates by computing Dice on 2D slices. """
-        model.eval()
-        dice_metric = DiceMetric(include_background=False, reduction="mean")
-        
-        with torch.no_grad():
-            for batch in tqdm(val_loader, desc="Validating"):
-                # The validation dataset is not contrastive
-                # A simple FlareSliceDataset with is_contrastive=False would be better
-                # but we can just use the first image from the contrastive set
-                image, _, label, _ = batch
-                image, label = image.to(self.device), label.to(self.device)
-                
-                with torch.autocast(device_type='cuda', dtype=torch.float16):
-                    _, prediction = model(image)
-                
-                # Convert prediction to one-hot format for DiceMetric
-                pred_one_hot = F.one_hot(prediction.argmax(dim=1), num_classes=self.args.output_channel).permute(0, 3, 1, 2)
-                label_one_hot = F.one_hot(label, num_classes=self.args.output_channel).permute(0, 3, 1, 2)
-                
-                dice_metric(y_pred=pred_one_hot, y=label_one_hot)
-        
-        mean_dice = dice_metric.aggregate().item()
-        dice_metric.reset()
-        model.train()
-        return mean_dice
+            # Model Checkpointing
+            if val_log['val_dice'] > best_val_dice:
+                best_val_dice = val_log['val_dice']
+                state_dict = model._orig_mod.state_dict() if hasattr(model, '_orig_mod') else model.state_dict()
+                torch.save(state_dict, model_dir / 'best_model.pt')
+                print(f"=> New best model saved with Dice: {best_val_dice:.4f}")
 
+    writer.close()
+    wandb.finish()
+    print(f"\nTraining finished. Best validation Dice: {best_val_dice:.4f}")
 
 if __name__ == '__main__':
-    trainer = SegCLR_FLARE(args)
-    trainer.joint_train_on_source_and_target()
+    main()

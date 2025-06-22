@@ -7,6 +7,8 @@ import albumentations as A
 import torch
 import torch.backends.cudnn as cudnn
 import torch.optim as optim
+import torch.nn.functional as F
+from monai.data import decollate_batch
 from monai.metrics import DiceMetric
 from monai.transforms import Compose, AsDiscrete
 # from monai.data import CacheDataset, DataLoader
@@ -37,7 +39,8 @@ def parse_args():
     parser.add_argument('--val_domain', default="validation_mri", help='Validation set name.')
     parser.add_argument('--two_d', action='store_true', help='Use 2D model instead of 3D.')
     parser.add_argument('--three_d', action='store_true', help='Use 3D model instead of 2D.')
-
+    parser.add_argument('--deep_supervision', action='store_true', help='Enable deep supervision for the U-Net model.')
+    
     # --- Training Hyperparameters ---
     parser.add_argument('--epochs', default=100, type=int, help='Number of total epochs to run.')
     parser.add_argument('--early_stop', default=None, type=int, help='Early stopping patience.')
@@ -64,9 +67,32 @@ def parse_args():
 
     return args
 
+def calculate_deep_supervision_loss(outputs, labels, criterion):
+    """
+    Calculates the weighted sum of losses for deep supervision.
+    'outputs' is a list of tensors from the model.
+    'labels' is the single high-resolution ground truth.
+    """
+    total_loss = 0
+    # Define weights for each output, from coarsest to finest
+    # The final, full-resolution output gets the highest weight.
+    # These weights are often tuned as hyperparameters.
+    weights = torch.tensor([0.2, 0.4, 0.8, 1.0], device=labels.device)
+    
+    for i, pred in enumerate(outputs):
+        # Downsample the ground truth label to match the current prediction's spatial size
+        # Use 'nearest' mode for integer labels to avoid interpolation artifacts
+        gt_downsampled = F.interpolate(labels.float(), size=pred.shape[2:], mode='nearest')
+        
+        # Calculate the loss for this level
+        level_loss = criterion(pred, gt_downsampled)
+        total_loss += weights[i] * level_loss
+        
+    return total_loss
+
 # --- 2. Training and Validation Epoch Functions ---
 
-def train_epoch(model, loader, optimizer, criterion, scaler, device):
+def train_epoch(model, loader, optimizer, criterion, scaler, device, use_deep_supervision):
     model.train()
     loss_meter = AverageMeter()
     
@@ -78,7 +104,11 @@ def train_epoch(model, loader, optimizer, criterion, scaler, device):
         
         with autocast(device_type=device.type, dtype=torch.float16):
             outputs = model(images)
-            loss = criterion(outputs, labels)
+            # loss = criterion(outputs, labels)
+            if use_deep_supervision:
+                loss = calculate_deep_supervision_loss(outputs, labels, criterion)
+            else:
+                loss = criterion(outputs, labels)
         
         scaler.scale(loss).backward()
         scaler.step(optimizer)
@@ -88,7 +118,7 @@ def train_epoch(model, loader, optimizer, criterion, scaler, device):
         
     return OrderedDict([('loss', loss_meter.avg)])
 
-def validate_epoch(model, loader, criterion, dice_metric, device, post_trans): # Add criterion and post_trans
+def validate_epoch(model, loader, criterion, dice_metric, device, post_trans, use_deep_supervision): # Add criterion and post_trans
     model.eval()
     dice_metric.reset()
     loss_meter = AverageMeter() # Let's also track validation loss
@@ -102,18 +132,24 @@ def validate_epoch(model, loader, criterion, dice_metric, device, post_trans): #
                 # Get the raw logits from the model
                 outputs = model(images)
                 # Calculate validation loss
-                loss = criterion(outputs, labels)
+                # loss = criterion(outputs, labels)
+                if use_deep_supervision:
+                    final_outputs = outputs[-1] # Get the last element from the list
+                else:
+                    final_outputs = outputs
+                loss = criterion(final_outputs, labels)
 
             loss_meter.update(loss.item(), images.size(0))
 
             # --- MONAI's streamlined post-processing ---
             # 1. Decollate the batch into a list of channel-first tensors
             #    This is required for the transforms to work on each item individually.
-            outputs_list = list(outputs)
-            labels_list = list(labels)
+            outputs_list = decollate_batch(final_outputs)
+            labels_list = decollate_batch(labels)
 
             # 2. Apply the post-processing transforms (argmax + one-hot)
             processed_outputs = [post_trans(output_item) for output_item in outputs_list]
+            # processed_labels = [post_trans(label_item) for label_item in labels_list]
 
             # 3. The metric can now directly consume the processed outputs and labels
             dice_metric(y_pred=processed_outputs, y=labels_list)
@@ -194,7 +230,7 @@ def main():
     concat_datasets = concatenate_datasets([hf_train, hf_train_pseudo])
     # concat_datasets = hf_train
     train_dataset_concat = FlarePatchDataset(concat_datasets, patch_size=PATCH_SIZE_TRAIN, is_train=True, is_contrastive=False)
-    train_dataset_concate_cached = CacheDataset(data=train_dataset_concat, cache_rate=1., num_workers=args.num_workers, runtime_cache="processes")
+    train_dataset_concate_cached = CacheDataset(data=train_dataset_concat, cache_rate=1., num_workers=args.num_workers)
     val_dataset_cached = CacheDataset(data=val_dataset, cache_rate=1., num_workers=args.num_workers)
 
     # train_dataset_concat = ConcatDataset([train_dataset_cached, train_dataset_pseudo_cached])
@@ -205,8 +241,13 @@ def main():
 
     
     # --- Model, Loss, Optimizer, and Metrics ---
-    model = UNet(in_channels=1, out_channels=args.output_channel).to(device)
-
+    print(f"Deep Supervision Enabled: {args.deep_supervision}")
+    # This assumes your UNet is the custom one from unet.py that accepts this flag
+    model = UNet(
+        in_channels=1, 
+        out_channels=args.output_channel,
+        deep_supervision=args.deep_supervision
+    ).to(device)
 
     print("Compiling training and validation steps...")
     try:
@@ -225,7 +266,7 @@ def main():
     criterion = MultiClassDiceCELoss(num_classes=args.output_channel, weight=class_weights)
     
     # optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-5, fused=True)
-    optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-5)
+    optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
     # scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
     # lr = init_lr * ( 1 - epoch / args.epochs )^ 0.9
     scheduler = optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lambda epoch: (1 - epoch / args.epochs) ** 0.9)
@@ -254,9 +295,9 @@ def main():
     epoch_progress = tqdm(range(1, args.epochs + 1), desc="Training Progress", unit="epoch")
     for epoch in epoch_progress:
         
-        train_log = train_epoch_compiled(model, train_loader_concat, optimizer, criterion, scaler, device)
+        train_log = train_epoch_compiled(model, train_loader_concat, optimizer, criterion, scaler, device, args.deep_supervision)
         if epoch % args.validate_every == 0 or epoch == args.epochs:
-            val_log = validate_epoch_compiled(model, val_loader, criterion, dice_metric, device, post_trans)
+            val_log = validate_epoch_compiled(model, val_loader, criterion, dice_metric, device, post_trans, args.deep_supervision)
 
             epoch_progress.set_postfix(loss=train_log['loss'], val_dice=val_log['val_dice'], val_loss=val_log['val_loss'])
             writer.add_scalar("Dice/val", val_log['val_dice'], epoch)

@@ -2,6 +2,8 @@ import torch
 # from torch.utils.data import Dataset
 from monai.data import Dataset
 import SimpleITK as sitk
+import warnings
+warnings.filterwarnings("ignore", ".*unexpected scales in sform.*")
 # Import the necessary 3D-capable MONAI transforms
 from monai.transforms import (
     Compose,
@@ -31,6 +33,82 @@ from typing import Dict, Union, List, Any
 from datasets import load_dataset
 import numpy as np
 # --- STEP 1: Create a simple, self-contained custom transform ---
+
+NUM_CLASSES = 14  # Number of classes in the FLARE-3D dataset
+
+# In dataset.py, near the top
+class SafeNormalizeIntensityd(MapTransform):
+    """
+    A wrapper for NormalizeIntensityd that adds a small epsilon to the
+    standard deviation to prevent division-by-zero errors when an image
+    patch is all zeros.
+    """
+    def __init__(self, keys: list, nonzero: bool = True, channel_wise: bool = True, subtrahend=None, divisor=None):
+        super().__init__(keys, allow_missing_keys=True)
+        self.normalizer = NormalizeIntensityd(
+            keys=keys, 
+            nonzero=nonzero, 
+            channel_wise=channel_wise,
+            subtrahend=subtrahend,
+            divisor=divisor
+        )
+        self.nonzero = nonzero
+
+    def __call__(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        d = dict(data)
+        for key in self.keys:
+            if key in d:
+                img = d[key]
+                # If nonzero is True, check if there are any non-zero pixels
+                if self.nonzero and torch.count_nonzero(img) == 0:
+                    # If the image is all zeros, normalization is not needed and unsafe.
+                    # The image remains all zeros.
+                    continue
+                
+                # For non-zero images, apply the standard normalizer
+                # We can add an epsilon to the divisor calculation within the original,
+                # but a simpler safe-guard is to just check std dev.
+                pix_to_consider = img[img != 0] if self.nonzero else img.flatten()
+                if pix_to_consider.numel() > 0 and torch.std(pix_to_consider) > 1e-6:
+                    d = self.normalizer(d)
+                # else: if std is zero, do nothing, the image is constant.
+        return d
+    
+class ClipIntensityPercentiled(MapTransform):
+    """
+    Dictionary-based transform to clip intensity values based on calculated percentiles.
+    This is the standard approach for MRI normalization.
+    """
+    def __init__(self, keys: list, lower_percentile: float, upper_percentile: float):
+        """
+        Args:
+            keys: Keys of the tensors to clip.
+            lower_percentile: The lower percentile (e.g., 0.5).
+            upper_percentile: The upper percentile (e.g., 99.5).
+        """
+        super().__init__(keys, allow_missing_keys=True)
+        self.lower_p = lower_percentile
+        self.upper_p = upper_percentile
+
+    def __call__(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        d = dict(data)
+        for key in self.keys:
+            if key in d:
+                img_tensor = d[key]
+                
+                # Calculate the percentile values from the non-zero elements of the image
+                # This is important to avoid the large number of background zeros skewing the percentiles
+                non_zero_vals = img_tensor[img_tensor > 0]
+                if non_zero_vals.numel() == 0:
+                    # If image is all zeros, do nothing
+                    continue
+
+                lower_bound = torch.quantile(non_zero_vals, self.lower_p / 100.0)
+                upper_bound = torch.quantile(non_zero_vals, self.upper_p / 100.0)
+                
+                # Clip the image tensor to the calculated bounds
+                d[key] = torch.clamp(img_tensor, lower_bound, upper_bound)
+        return d
     
 class LoadSlice(MapTransform):
     """
@@ -89,20 +167,19 @@ class LoadSlice(MapTransform):
                 
         return d
 
+
 class OnTheFly2DDataset(Dataset):
     """
-    An efficient 2D Dataset that loads slices on-the-fly without pre-processing.
-    This version uses a simple custom MONAI transform, making it robust and bug-free.
+    An efficient 2D Dataset that loads slices on-the-fly.
+    Generates two different augmented views for contrastive learning if enabled.
     """
     def __init__(self, hf_dataset, patch_size=(224, 192), is_train=True, is_contrastive=False):
         self.is_train = is_train
         self.patch_size = patch_size
         self.is_contrastive = is_contrastive
 
-        # The data for MONAI is just a list of dictionaries with file paths
         self.data_dicts = []
         for item in hf_dataset:
-            # We only need valid pairs for the dataset
             if item.get('image_path') and item['image_path'] != "N/A":
                 self.data_dicts.append({
                     "image": item['image_path'],
@@ -113,162 +190,123 @@ class OnTheFly2DDataset(Dataset):
         if not self.data_dicts:
             raise ValueError("hf_dataset did not yield any valid image paths.")
 
-        # The transformation pipeline now includes our custom loader
-        self.transforms = self._get_transforms()
-        
-    def _get_transforms(self):
-        # The keys we want our custom loader to process
-        loading_keys = ["image", "label"]
-        
-        xforms = [
-            # Our custom transform is the first step!
-            LoadSlice(keys=loading_keys),
-            # These transforms now operate on the 2D slice data in memory
-            EnsureChannelFirstd(keys=loading_keys, channel_dim="no_channel", allow_missing_keys=True),  # Converts to (C, H, W)
-            EnsureTyped(keys="image", dtype=torch.float32),  # Ensure image is float32 and on GPU
+        # --- Initialize two distinct transform pipelines ---
+        self.weak_transforms = self._get_weak_transforms()
+        if self.is_contrastive:
+            self.strong_transforms = self._get_strong_transforms()
+
+    def _get_base_transforms(self):
+        """Common transforms for both pipelines (loading and initial formatting)."""
+        LOWER_BOUND = -50000
+        UPPER_BOUND = 50000
+        return [
+            LoadSlice(keys=["image", "label"]),
+            EnsureChannelFirstd(keys=["image", "label"], channel_dim="no_channel", allow_missing_keys=True),
+            EnsureTyped(keys="image", dtype=torch.float32),
             EnsureTyped(keys="label", dtype=torch.int8, allow_missing_keys=True),
-            ResizeWithPadOrCropd(keys=["image", "label"], spatial_size=self.patch_size, allow_missing_keys=True),
+            ClipIntensityPercentiled(keys="image", lower_percentile=2, upper_percentile=98),
         ]
+
+    def _get_weak_transforms(self):
+        """Standard augmentations for training (view x) or validation."""
+        xforms = self._get_base_transforms()
         
         if self.is_train:
-            # resize double the size of patch_size if image_size is smaller than patch_size
             xforms.extend([
-                # Note: RandSpatialCropd will only operate on keys that exist in the dict
-                RandFlipd(keys=["image", "label"], prob=0.5, spatial_axis=0),
-                RandFlipd(keys=["image", "label"], prob=0.5, spatial_axis=1),
-                RandRotate90d(
-                    keys=["image", "label"],
-                    prob=0.5,
-                    max_k=3, # Max number of 90-degree rotations
-                    spatial_axes=(0, 1), # Rotate in the X-Y plane
-                ),
-                RandAffined(
-                    keys=["image", "label"],
-                    prob=0.1,
-                    rotate_range=(0.05,),          # 2D rotation
-                    scale_range=(0.1,),             # 2D isotropic scaling
-                    translate_range=(5, 5),         # 2D translation (H, W)
-                    shear_range=(0.05,),            # 2D shear
-                    spatial_size=self.patch_size,   # The target 2D patch size
-                    mode=("bilinear", "nearest"),
-                ),
-                RandScaleIntensityd(keys="image", factors=0.1, prob=0.1),
-                # RandShiftIntensityd(keys="image", offsets=0.1, prob=0.1),
-                RandGaussianNoised(keys="image", std=0.1, prob=0.01),
+                ResizeWithPadOrCropd(keys=["image", "label"], spatial_size=self.patch_size, allow_missing_keys=True),
+                RandFlipd(keys=["image", "label"], prob=0.5, spatial_axis=1, allow_missing_keys=True), # Horizontal flip
+                RandRotate90d(keys=["image", "label"], prob=0.5, max_k=3, spatial_axes=(0, 1), allow_missing_keys=True),
             ])
-        
-        xforms.append(NormalizeIntensityd(keys="image", nonzero=True, channel_wise=True))
+        else: # For validation, just resize.
+            xforms.append(ResizeWithPadOrCropd(keys=["image", "label"], spatial_size=self.patch_size, allow_missing_keys=True))
+            
+        xforms.append(SafeNormalizeIntensityd(keys="image", nonzero=True, channel_wise=True))
         return Compose(xforms)
-    
-    def _get_contrastive_transforms(self):
-        """
-        Returns a separate set of transforms for contrastive learning.
-        First, the augmentation-based pair formation typically employed
-        for natural images (e.g., in SimCLR and SimSiam) is
-        adapted for OCT slices, denoted as Pa. To that end, labeled
-        slices in Ds and random slices in Dt are augmented with
-        horizontal flipping (p = 0.5), horizontal and vertical translation
-        (within 25% of the image size), zoom in (up to 50%),
-        and color distortion (brightness up to 60% and jittering up to 
-        20%). For color augmentation, images are first transformed to
-        RGB and then back to grayscale.
-        """
-        xforms = [
-            # Our custom transform is the first step!
-            LoadSlice(keys=["image", "label"]),
-            # These transforms now operate on the 2D slice data in memory
-            EnsureChannelFirstd(keys=["image", "label"], channel_dim="no_channel", allow_missing_keys=True),  # Converts to (C, H, W)
-            EnsureTyped(keys="image", dtype=torch.float32),  # Ensure image is float32 and on GPU
-            EnsureTyped(keys="label", dtype=torch.int8, allow_missing_keys=True),
-            ResizeWithPadOrCropd(keys=["image", "label"], spatial_size=self.patch_size, allow_missing_keys=True),
-        ]
-        # Contrastive transforms are similar to training transforms but with more augmentations
-        contrastive_transforms = [
-            # RandFlipd(keys=["image", "label"], prob=0.5, spatial_axis=0),
-            RandFlipd(keys=["image", "label"], prob=0.2, spatial_axis=1, 
-                      allow_missing_keys=True),
-            RandAffined(keys=["image", "label"], prob=0.2, scale_range=(0.5, 0.5), 
-                        padding_mode="reflection", 
-                        allow_missing_keys=True),
-            RandAffined(keys=["image", "label"], prob=0.2, 
-                        translate_range=(self.patch_size[0] * 0.25, self.patch_size[1] * 0.25), 
-                        mode="bilinear", padding_mode="reflection", 
-                        allow_missing_keys=True),
-            RandAffined(keys=["image", "label"], prob=0.2, 
-                        scale_range=((0.7, 1.5), (0.7, 1.5)), 
-                        translate_range=(self.patch_size[0] * 0.25, self.patch_size[1] * 0.25), 
-                        mode="bilinear", padding_mode="reflection", allow_missing_keys=True),
-            # RandAffined(
-            #     keys="image",
-            #     prob=0.5, # Always apply strong geometric augmentations for the second view
-            #     # Zoom in up to 50% => scale range from 1.0 to 1.5
-            #     # scale_range=(0.5, 0.5), # (min_zoom - 1, max_zoom - 1) -> (1.0-0.5, 1.5-1.0) -> (0.5, 0.5) is wrong, should be (1.0, 1.5)
-            #     # scale_range=(0.0, 0.5), # A scale factor of 1.0 is no change. So range is (e.g. 0.9 to 1.6)
-            #     # Let's interpret "zoom in up to 50%" as scaling between 100% and 150% of original size
-            #     # And "zoom out" could be included by going below 1.0. Let's use a symmetric range for robustness.
-            #     scale_range=((0.7, 1.5), (0.7, 1.5)), # Isotropic scaling between 70% and 150%
-            #     # Translate up to 25% of the image size.
-            #     # If patch_size is (224, 192), 25% is (56, 48)
-            #     translate_range=(self.patch_size[0] * 0.25, self.patch_size[1] * 0.25),
-            #     mode=("bilinear", "nearest"),
-            #     padding_mode="reflection",
-            #     allow_missing_keys=True,
-            # ),
-            RandRotate90d(
+
+    def _get_strong_transforms(self):
+        """Strong augmentations for the second contrastive view (x')."""
+        
+        albumentations_xforms = A.Compose([
+            A.ToRGB(p=1.0),
+            A.ColorJitter(brightness=0.6, contrast=0.2, p=0.8),
+            A.ToGray(p=1.0, num_output_channels=1),
+        ])
+
+        def apply_albumentations(img_numpy):
+            img_numpy = img_numpy.squeeze(0).numpy()  # Remove channel dimension if present
+            augmented = albumentations_xforms(image=img_numpy)['image']
+            return torch.from_numpy(augmented).unsqueeze(0)  # Add channel dimension back
+
+        xforms = self._get_base_transforms()
+        xforms.extend([
+            RandAffined(
                 keys=["image", "label"],
-                prob=0.5,
-                max_k=3,
-                spatial_axes=(0, 1),
+                prob=0.9,
+                scale_range=((0.7, 1.5), (0.7, 1.5)), 
+                translate_range=(self.patch_size[0] * 0.25, self.patch_size[1] * 0.25),
+                rotate_range=(np.pi / 6,), # Rotate up to 30 degrees
+                mode=("bilinear", "nearest"),
+                padding_mode="reflection",
                 allow_missing_keys=True
             ),
             ResizeWithPadOrCropd(keys=["image", "label"], spatial_size=self.patch_size, allow_missing_keys=True),
-            RandGaussianNoised(keys="image", std=0.1, prob=0.01),
-            RandScaleIntensityd(keys="image", factors=0.1, prob=0.1),
-            RandShiftIntensityd(keys="image", offsets=0.1, prob=0.1),
-            NormalizeIntensityd(keys="image", nonzero=True, channel_wise=True),
-        ]
-        return Compose(xforms + contrastive_transforms)
-
+            Lambdad(keys="image", func=apply_albumentations),
+            RandGaussianNoised(keys="image", std=0.1, prob=0.1),
+            SafeNormalizeIntensityd(keys="image", nonzero=True, channel_wise=True),
+        ])
+        return Compose(xforms)
+    
     def __len__(self):
         return len(self.data_dicts)
 
     def __getitem__(self, idx):
-        # Get the initial dictionary of file paths
         item_dict = self.data_dicts[idx].copy()
-
-        # In training, randomly decide which pseudo-label to use (if available)
+        
         label_path_to_use = None
-        if self.is_train and item_dict["label"] != "N/A" and item_dict["label1"] != "N/A":
-            # If training with two valid labels, randomly pick one's path
+        if self.is_train and item_dict.get("label1") and item_dict["label1"] != "N/A":
             chosen_key = random.choice(["label", "label1"])
             label_path_to_use = item_dict[chosen_key]
         else:
-            # For validation or if only one label exists, use the primary 'label' if available
             label_path_to_use = item_dict.get("label", "N/A")
-        clean_dict = {
-                "image": item_dict["image"],
-                "label": label_path_to_use
-            }
+            
+        clean_dict = {"image": item_dict["image"], "label": label_path_to_use}
         if clean_dict["label"] == "N/A":
-        # If no label, we can't use this for supervised training/validation.
-        # Here we choose to remove the key so transforms like RandCropByPosNegLabeld don't fail.
             del clean_dict["label"]
-        
-        # MONAI's Compose pipeline handles everything from here
-        if not self.is_contrastive:
-            processed_data = self.transforms(clean_dict)
-            if len(np.unique(processed_data["label"])) > 14:
-                raise ValueError(f"Label has more than 14 classes: {np.unique(processed_data['label'])}. "
-                             "Ensure labels are one-hot encoded or properly formatted.")
-            return processed_data
+
+        # --- Apply the correct pipelines ---
+        processed_data1 = self.weak_transforms(clean_dict)
+      # --- FIX: Create label tensor and flag ---
+        if "label" in processed_data1:
+            label_tensor = processed_data1["label"]
+            # Add a channel dimension if your label is (H, W) to make it (1, H, W)
+            # This is often needed for batching. Adjust if your labels are already channeled.
+            if label_tensor.ndim == 2:
+                 label_tensor = label_tensor.unsqueeze(0)
+            has_label = torch.tensor(True)
         else:
-            processed_data1 = self._get_contrastive_transforms()(clean_dict)
-            processed_data2 = self._get_contrastive_transforms()(clean_dict)
-            if "label" in processed_data1:
-                processed_data = {"image": processed_data1["image"], "label": processed_data1["label"], "image2": processed_data2["image"]}
-            else:
-                processed_data = {"image": processed_data1["image"], "image2": processed_data2["image"]}
-                return processed_data
+            # Create a placeholder tensor with the correct shape and type
+            # The shape should be (C, H, W). Here we assume C=1.
+            label_tensor = torch.zeros((1, self.patch_size[0], self.patch_size[1]), dtype=torch.int8)
+            has_label = torch.tensor(False)
+
+        # --- FIX: Construct the final dictionary with consistent keys ---
+        if self.is_contrastive:
+            # Note: For consistency, always process the same dict for both views
+            # Here we re-process the original image dict for strong transforms
+            processed_data2 = self.strong_transforms({"image": item_dict["image"]})
+
+            return {
+                "image": processed_data1["image"],
+                "image2": processed_data2["image"],
+                "label": label_tensor,
+                "has_label": has_label  # This flag is crucial for your training loop
+            }
+        else: # Non-contrastive case
+            return {
+                "image": processed_data1["image"],
+                "label": label_tensor,
+                "has_label": has_label
+            }
 
 
 
@@ -322,7 +360,7 @@ class Flare3DPatchDataset(Dataset):
                         RandFlipd(keys=keys, prob=0.5, spatial_axis=0),
                         RandFlipd(keys=keys, prob=0.5, spatial_axis=1),
                         RandFlipd(keys=keys, prob=0.5, spatial_axis=2),
-                        NormalizeIntensityd(keys="image", nonzero=True, channel_wise=True),
+                        SafeNormalizeIntensityd(keys="image", nonzero=True, channel_wise=True),
                         RandScaleIntensityd(keys="image", factors=0.1, prob=1.0),
                         RandShiftIntensityd(keys="image", offsets=0.1, prob=1.0),
                     ]
@@ -343,7 +381,7 @@ class Flare3DPatchDataset(Dataset):
                                     num_samples=1,
                                     image_key="image",
                                     image_threshold=0),
-                NormalizeIntensityd(keys="image", nonzero=True, channel_wise=True),
+                SafeNormalizeIntensityd(keys="image", nonzero=True, channel_wise=True),
             ]
             return Compose(initial_transforms + val_transforms)
             # return Compose(initial_transforms)
@@ -395,8 +433,8 @@ if __name__ == "__main__":
     dataset = OnTheFly2DDataset(hf_dataset, patch_size=patch_size, is_train=True, is_contrastive=True)
     print(f"Dataset length: {len(dataset)}")
     for i in range(len(dataset)):
-        samples1, samples2 = dataset[i]
-        print(samples1["image"].shape, samples1["label"].shape, samples2["image"].shape)
+        samples = dataset[i]
+        print(samples["image"].shape, samples["label"].shape, samples["image2"].shape)
         break
         # if len(torch.unique(sample['label'])) > 14:
         #     print(f"Sample {i} has more than 14 classes in label: {torch.unique(sample['label'])}")

@@ -19,7 +19,7 @@ from monai.transforms import (
     MapTransform,
     Pad,
     ResizeWithPadOrCropd,
-    RandRotate90d
+    RandRotate90d,
 )
 
 from monai.data import NibabelReader
@@ -183,10 +183,10 @@ class OnTheFly2DDataset(Dataset):
             # Our custom transform is the first step!
             LoadSlice(keys=loading_keys),
             # These transforms now operate on the 2D slice data in memory
-            EnsureChannelFirstd(keys=loading_keys, channel_dim="no_channel"),
+            EnsureChannelFirstd(keys=loading_keys, channel_dim="no_channel", allow_missing_keys=True),  # Converts to (C, H, W)
             EnsureTyped(keys="image", dtype=torch.float32),  # Ensure image is float32 and on GPU
-            EnsureTyped(keys="label", dtype=torch.int8),
-            ResizeWithPadOrCropd(keys=["image", "label"], spatial_size=self.patch_size),
+            EnsureTyped(keys="label", dtype=torch.int8, allow_missing_keys=True),
+            ResizeWithPadOrCropd(keys=["image", "label"], spatial_size=self.patch_size, allow_missing_keys=True),
         ]
         
         if self.is_train:
@@ -218,6 +218,75 @@ class OnTheFly2DDataset(Dataset):
         
         xforms.append(NormalizeIntensityd(keys="image", nonzero=True, channel_wise=True))
         return Compose(xforms)
+    
+    def _get_contrastive_transforms(self):
+        """
+        Returns a separate set of transforms for contrastive learning.
+        First, the augmentation-based pair formation typically employed
+        for natural images (e.g., in SimCLR and SimSiam) is
+        adapted for OCT slices, denoted as Pa. To that end, labeled
+        slices in Ds and random slices in Dt are augmented with
+        horizontal flipping (p = 0.5), horizontal and vertical translation
+        (within 25% of the image size), zoom in (up to 50%),
+        and color distortion (brightness up to 60% and jittering up to 
+        20%). For color augmentation, images are first transformed to
+        RGB and then back to grayscale.
+        """
+        xforms = [
+            # Our custom transform is the first step!
+            LoadSlice(keys=["image", "label"]),
+            # These transforms now operate on the 2D slice data in memory
+            EnsureChannelFirstd(keys=["image", "label"], channel_dim="no_channel", allow_missing_keys=True),  # Converts to (C, H, W)
+            EnsureTyped(keys="image", dtype=torch.float32),  # Ensure image is float32 and on GPU
+            EnsureTyped(keys="label", dtype=torch.int8, allow_missing_keys=True),
+            ResizeWithPadOrCropd(keys=["image", "label"], spatial_size=self.patch_size, allow_missing_keys=True),
+        ]
+        # Contrastive transforms are similar to training transforms but with more augmentations
+        contrastive_transforms = [
+            # RandFlipd(keys=["image", "label"], prob=0.5, spatial_axis=0),
+            RandFlipd(keys=["image", "label"], prob=0.2, spatial_axis=1, 
+                      allow_missing_keys=True),
+            RandAffined(keys=["image", "label"], prob=0.2, scale_range=(0.5, 0.5), 
+                        padding_mode="reflection", 
+                        allow_missing_keys=True),
+            RandAffined(keys=["image", "label"], prob=0.2, 
+                        translate_range=(self.patch_size[0] * 0.25, self.patch_size[1] * 0.25), 
+                        mode="bilinear", padding_mode="reflection", 
+                        allow_missing_keys=True),
+            RandAffined(keys=["image", "label"], prob=0.2, 
+                        scale_range=((0.7, 1.5), (0.7, 1.5)), 
+                        translate_range=(self.patch_size[0] * 0.25, self.patch_size[1] * 0.25), 
+                        mode="bilinear", padding_mode="reflection", allow_missing_keys=True),
+            # RandAffined(
+            #     keys="image",
+            #     prob=0.5, # Always apply strong geometric augmentations for the second view
+            #     # Zoom in up to 50% => scale range from 1.0 to 1.5
+            #     # scale_range=(0.5, 0.5), # (min_zoom - 1, max_zoom - 1) -> (1.0-0.5, 1.5-1.0) -> (0.5, 0.5) is wrong, should be (1.0, 1.5)
+            #     # scale_range=(0.0, 0.5), # A scale factor of 1.0 is no change. So range is (e.g. 0.9 to 1.6)
+            #     # Let's interpret "zoom in up to 50%" as scaling between 100% and 150% of original size
+            #     # And "zoom out" could be included by going below 1.0. Let's use a symmetric range for robustness.
+            #     scale_range=((0.7, 1.5), (0.7, 1.5)), # Isotropic scaling between 70% and 150%
+            #     # Translate up to 25% of the image size.
+            #     # If patch_size is (224, 192), 25% is (56, 48)
+            #     translate_range=(self.patch_size[0] * 0.25, self.patch_size[1] * 0.25),
+            #     mode=("bilinear", "nearest"),
+            #     padding_mode="reflection",
+            #     allow_missing_keys=True,
+            # ),
+            RandRotate90d(
+                keys=["image", "label"],
+                prob=0.5,
+                max_k=3,
+                spatial_axes=(0, 1),
+                allow_missing_keys=True
+            ),
+            ResizeWithPadOrCropd(keys=["image", "label"], spatial_size=self.patch_size, allow_missing_keys=True),
+            RandGaussianNoised(keys="image", std=0.1, prob=0.01),
+            RandScaleIntensityd(keys="image", factors=0.1, prob=0.1),
+            RandShiftIntensityd(keys="image", offsets=0.1, prob=0.1),
+            NormalizeIntensityd(keys="image", nonzero=True, channel_wise=True),
+        ]
+        return Compose(xforms + contrastive_transforms)
 
     def __len__(self):
         return len(self.data_dicts)
@@ -245,174 +314,16 @@ class OnTheFly2DDataset(Dataset):
             del clean_dict["label"]
         
         # MONAI's Compose pipeline handles everything from here
-        processed_data = self.transforms(clean_dict)
-
-        # For validation, we need to crop manually if needed, as Rand... transforms are off
-        if not self.is_train:
-            # Example of a center crop for validation
-            cropper = RandSpatialCropd(keys=["image", "label"], roi_size=self.patch_size, random_size=False)
-            processed_data = cropper(processed_data)
-
-        if len(np.unique(processed_data["label"])) > 14:
-            raise ValueError(f"Label has more than 14 classes: {np.unique(processed_data['label'])}. "
+        if not self.is_contrastive:
+            processed_data = self.transforms(clean_dict)
+            if len(np.unique(processed_data["label"])) > 14:
+                raise ValueError(f"Label has more than 14 classes: {np.unique(processed_data['label'])}. "
                              "Ensure labels are one-hot encoded or properly formatted.")
-            
-        return processed_data
-    
-    
-class RandSliceSampling(torch.nn.Module):
-    """
-    Randomly selects a slice along the depth dimension from a 4D tensor (C, D, H, W).
-    """
-    def __init__(self, keys: List[str], dim: int = 1, prob: float = 1.0):
-        """
-        Args:
-            keys: Keys in the data dictionary to apply the transform to.
-            dim: The dimension along which to sample slices. For (C, D, H, W), dim=1 is depth.
-            prob: Probability of applying the transform.
-        """
-        super().__init__()
-        self.keys = keys
-        self.dim = dim
-        self.prob = prob
-
-    def forward(self, data: Dict[str, Any]) -> Dict[str, Any]:
-        if not self.same_prob(self.prob):
-            return data
-
-        new_data = {}
-        for key in data.keys():
-            if key in self.keys:
-                tensor = data[key]
-                if tensor.ndim == 4: # Expecting (C, D, H, W)
-                    depth_size = tensor.shape[self.dim]
-                    if depth_size <= 0:
-                        raise ValueError(f"Dimension {self.dim} has size {depth_size}, cannot sample.")
-                    slice_index = random.randint(0, depth_size - 1)
-                    # Select the slice along the specified dimension
-                    sliced_tensor = torch.index_select(tensor, self.dim, torch.tensor(slice_index))
-                    new_data[key] = sliced_tensor.squeeze(self.dim) 
-                else:
-                    # If not 4D, pass through unchanged (e.g., label if it's already processed)
-                    new_data[key] = tensor
-            else:
-                new_data[key] = data[key] # Pass through other keys unchanged)
-
-        return new_data
-
-    def same_prob(self, p: float):
-        """Helper to check if the transform should be applied based on probability."""
-        return random.random() < p
-    
-    
-    
-class Flare2DPatchDataset(Dataset):
-    """
-    Robust 2D Dataset for the FLARE challenge using 2D patch sampling with random slice selection.
-    Assumes 3D NIfTI files are loaded, and then a random slice is taken along the depth
-    dimension to create 2D data.
-    """
-    def __init__(self, hf_dataset, patch_size=(224, 192), is_train=True, is_contrastive=False):
-        self.file_list = []
-        for item in hf_dataset:
-            # Handle cases with potentially missing labels
-            if item.get('label_path') and item['label_path'] != "N/A":
-                self.file_list.append({"image": item['image_path'], "label": item['label_path']})
-                self.keys = ["image", "label"]
-                if item["label_path1"] != "N/A":
-                    # If there's a second label, append it too
-                    # add label1 to the last file_list
-                    self.file_list[-1]["label1"] = item['label_path1']
-                    self.keys.append("label1")
-
-        if not self.file_list:
-            raise ValueError("No valid image-label pairs found. Ensure your data has labels.")
-
-        self.patch_size = patch_size # Should be (H, W)
-        self.is_train = is_train
-        self.is_contrastive = is_contrastive
-
-        self.transforms = self.get_transforms()
-
-    def get_transforms(self):
-        """Builds and returns the MONAI transformation pipeline for 2D patches."""
-        # if exist two labels, randomly select one
-        if len(self.keys) > 2:
-            label_value = random.choice(self.keys[1:])  # Randomly select one of the label keys
-            self.keys = [self.keys[0], label_value]  # Keep only the image and the selected label
-        # Initial transforms
-        initial_transforms = [
-            LoadImaged(keys=self.keys, reader=NibabelReader(to_gpu=True)),
-            EnsureChannelFirstd(keys=self.keys, channel_dim="no_channel"), # Converts to (C, D, H, W)
-            EnsureTyped(keys=self.keys),
-            RandSliceSampling(keys=self.keys, dim=-1)
-        ]
-
-        if self.is_train:
-            train_transforms = [
-                # --- CHANGE ---
-                RandSpatialCropd(
-                    keys=self.keys,
-                    roi_size=self.patch_size,
-                ),
-                # Flips are now 2D. spatial_axis=0 is H, spatial_axis=1 is W.
-                RandFlipd(keys=self.keys, prob=0.5, spatial_axis=0), # Flip along H
-                RandFlipd(keys=self.keys, prob=0.5, spatial_axis=1), # Flip along W
-                
-                RandGaussianNoised(keys="image", std=0.01, prob=0.1),
-                
-                # --- CHANGE ---
-                # RandAffined parameters must now be 2D.
-                RandAffined(
-                    keys=self.keys,
-                    prob=0.5,
-                    rotate_range=(0.05,),          # 2D rotation
-                    scale_range=(0.1,),             # 2D isotropic scaling
-                    translate_range=(5, 5),         # 2D translation (H, W)
-                    shear_range=(0.05,),            # 2D shear
-                    spatial_size=self.patch_size,   # The target 2D patch size
-                    mode=("bilinear", "nearest"),
-                ),
-                NormalizeIntensityd(keys="image", nonzero=True, channel_wise=True),
-                RandScaleIntensityd(keys="image", factors=0.1, prob=1.0),
-                RandShiftIntensityd(keys="image", offsets=0.1, prob=1.0),
-                
-            ]
-            return Compose(initial_transforms + train_transforms)
-
-        else: # Validation transforms
-            val_transforms = [
-                NormalizeIntensityd(keys="image", nonzero=True, channel_wise=True),
-            ]
-            return Compose(initial_transforms + val_transforms)
-
-    def __len__(self):
-        return len(self.file_list)
-
-    def __getitem__(self, idx):
-        data_dict = self.transforms(self.file_list[idx])
-
-        # After RandSliceSamplingd and RandCropByPosNegLabeld,
-        # image and label should be (C, H, W) e.g., (1, 224, 192)
-        image = data_dict['image']
-        # check if label is a string, if so use label1
-        if isinstance(data_dict["label"], str):
-            label = data_dict['label1'].long()  # Ensure label is a single channel
+            return processed_data
         else:
-            label = data_dict['label'].long()  # Ensure label is a single channel
-
-        
-        if self.is_contrastive:
-            data_dict2 = self.transforms(self.file_list[idx]) # Re-run transforms for the second view
-            image2 = data_dict2['image']
-            label2 = data_dict2['label'].long()
-            return image, image2, label, label2
-
-        if not self.is_train:
-            # For validation, return the processed slice along with path
-            return {"image": image, "label": label, "path": self.file_list[idx]['image']}
-
-        return {"image": image, "label": label}
+            processed_data1 = self._get_contrastive_transforms()(clean_dict)
+            processed_data2 = self._get_contrastive_transforms()(clean_dict)
+            return processed_data1, processed_data2
 
 
 
@@ -536,17 +447,19 @@ if __name__ == "__main__":
 #     # Assuming hf_dataset is already defined and loaded
     patch_size = (224, 192)  # Example patch size
     hf_dataset = load_dataset("./local_flare_loader.py", name="train_ct_pseudo", data_dir="/scratch/work/zhul2/data/FLARE-MedFM/FLARE-Task3-DomainAdaption", trust_remote_code=True)["train"]
-    dataset = OnTheFly2DDataset(hf_dataset, patch_size=patch_size, is_train=True)
+    dataset = OnTheFly2DDataset(hf_dataset, patch_size=patch_size, is_train=True, is_contrastive=True)
     print(f"Dataset length: {len(dataset)}")
     for i in range(len(dataset)):
-        sample = dataset[i]
+        samples1, samples2 = dataset[i]
+        print(samples1["image"].shape, samples1["label"].shape, samples2["image"].shape)
+        break
         # if len(torch.unique(sample['label'])) > 14:
         #     print(f"Sample {i} has more than 14 classes in label: {torch.unique(sample['label'])}")
         # Print the shapes of the image and label tensors
-        if 'label' in sample:
-            print(f"Sample {i} - Image shape: {sample['image'].shape}, Label shape: {sample['label'].shape}, Label unique values: {torch.unique(sample['label']).size()}")
-        else:
-            print(f"Sample {i} - Image shape: {sample['image'].shape}, No label available")
+        # if 'label' in sample:
+        #     print(f"Sample {i} - Image shape: {sample['image'].shape}, Label shape: {sample['label'].shape}, Label unique values: {torch.unique(sample['label']).size()}")
+        # else:
+        #     print(f"Sample {i} - Image shape: {sample['image'].shape}, No label available")
         # Uncomment to see the actual data
         # print(sample)
 

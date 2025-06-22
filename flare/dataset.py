@@ -110,60 +110,82 @@ class ClipIntensityPercentiled(MapTransform):
                 d[key] = torch.clamp(img_tensor, lower_bound, upper_bound)
         return d
     
+import SimpleITK as sitk
+import numpy as np
+import random
+from typing import Dict, Any, Optional
+from monai.transforms import MapTransform
+
+import SimpleITK as sitk
+import numpy as np
+import random
+from typing import Dict, Any
+from monai.transforms import MapTransform
+
 class LoadSlice(MapTransform):
     """
-    A simple MONAI transform to load a single 2D slice from a 3D NIfTI file.
-    This is space-efficient as it doesn't require pre-processing.
+    An OPTIMIZED transform to load a 2D slice from a 3D NIfTI file.
+    It loads the 3D volume into memory ONCE, finds all valid slice indices
+    using fast, vectorized NumPy operations, and then randomly selects one.
     """
-    def __init__(self, keys: list, axis: int = 2):
+    def __init__(self, keys: list, axis: int = 2, label_key: str = 'label'):
         """
         Args:
-            keys: The keys in the data dictionary that are file paths to load.
+            keys: Keys in the data dictionary to load slices for.
             axis: The axis from which to extract the slice (0=sag, 1=cor, 2=ax).
+            label_key: The key corresponding to the label data.
         """
         super().__init__(keys)
-        self.axis = axis
+        # Mapping from SimpleITK axis (X, Y, Z) to NumPy array axis (Z, Y, X)
+        self.sitk_to_np_axis = {0: 2, 1: 1, 2: 0} 
+        self.np_axis = self.sitk_to_np_axis[axis]
+        self.label_key = label_key
+        self.axis = axis  # Store the original axis for reference
+
+    def _get_valid_indices(self, volume_np: np.ndarray) -> np.ndarray:
+        """Finds indices of non-blank slices using vectorized numpy."""
+        # Sum over the spatial dimensions (H, W) of the slices
+        sum_axes = tuple(i for i in range(volume_np.ndim) if i != self.np_axis)
+        slice_sums = np.sum(volume_np, axis=sum_axes)
+        # Get the indices where the sum is greater than 0
+        return np.where(slice_sums > 0)[0]
 
     def __call__(self, data: Dict[str, Any]) -> Dict[str, Any]:
-        d = dict(data) # Create a copy to modify
+        d = dict(data)
         
-        # We need a slice index. Let's get it from the 'image' metadata.
-        # First, figure out the depth of the image volume.
-        image_path = d['image']
-        reader = sitk.ImageFileReader()
-        reader.SetFileName(image_path)
-        reader.ReadImageInformation()
-        depth = reader.GetSize()[self.axis]
+        # --- Step 1: Load all required volumes into memory first ---
+        # This minimizes disk I/O to one read per file path.
+        sitk_volumes = {
+            key: sitk.ReadImage(d[key]) 
+            for key in self.keys if key in d and d[key] != 'N/A'
+        }
         
-        # Pick a random slice index. This index will be used for all keys.
-        slice_idx = random.randint(0, depth - 1)
+        # --- Step 2: Determine the best set of valid slice indices ---
+        valid_indices = []
+        # Prioritize finding a slice with a label
+        if self.label_key in sitk_volumes:
+            label_np = sitk.GetArrayFromImage(sitk_volumes[self.label_key])
+            valid_indices = self._get_valid_indices(label_np)
         
-        # Now, load the specific slice for each key in our list
-        for key in self.keys:
-            if key in d:
-                filepath = d[key]
-                
-                # Load the full 3D image header and extract one slice
-                img_sitk = sitk.ReadImage(filepath)
-                
-                size = list(img_sitk.GetSize())
-                index = [0, 0, 0]
-                index[self.axis] = slice_idx
-                size[self.axis] = 1 # Extract a slice of thickness 1
+        # If no labeled slices are found (or no label exists), fallback to image
+        if len(valid_indices) == 0 and 'image' in sitk_volumes:
+            image_np = sitk.GetArrayFromImage(sitk_volumes['image'])
+            valid_indices = self._get_valid_indices(image_np)
         
-                extractor = sitk.ExtractImageFilter()
-                extractor.SetSize(size)
-                extractor.SetIndex(index)
-                img_slice_sitk = extractor.Execute(img_sitk)
-                
-                # Get pixel data and update the dictionary
-                pixel_data = sitk.GetArrayFromImage(img_slice_sitk).squeeze(0) # Shape: (H, W)
-                d[key] = pixel_data
-        # # move d[key] to gpu cuda
-        # for key in d.keys():
-        #     if isinstance(d[key], np.ndarray):
-        #         d[key] = torch.tensor(d[key], dtype=torch.float32).cuda()
-        
+        # --- Step 3: Choose a slice index ---
+        if len(valid_indices) > 0:
+            # Randomly choose from the list of good slices
+            slice_idx = random.choice(valid_indices)
+        else:
+            # Last resort: if the entire volume is blank, just pick a random slice
+            depth = sitk_volumes['image'].GetSize()[self.axis]
+            slice_idx = random.randint(0, depth - 1)
+            
+        # --- Step 4: Extract the chosen slice from each volume ---
+        for key, sitk_vol in sitk_volumes.items():
+            volume_np = sitk.GetArrayFromImage(sitk_vol)
+            # Use np.take to select the slice along the correct axis
+            d[key] = np.take(volume_np, slice_idx, axis=self.np_axis)
                 
         return d
 
@@ -197,13 +219,17 @@ class OnTheFly2DDataset(Dataset):
 
     def _get_base_transforms(self):
         """Common transforms for both pipelines (loading and initial formatting)."""
-        LOWER_BOUND = -50000
-        UPPER_BOUND = 50000
+
         return [
             LoadSlice(keys=["image", "label"]),
             EnsureChannelFirstd(keys=["image", "label"], channel_dim="no_channel", allow_missing_keys=True),
             EnsureTyped(keys="image", dtype=torch.float32),
             EnsureTyped(keys="label", dtype=torch.int8, allow_missing_keys=True),
+            Lambdad(
+            keys="label", 
+            func=lambda x: torch.clamp(x, min=0, max=NUM_CLASSES - 1),
+            allow_missing_keys=True
+                ),
             ClipIntensityPercentiled(keys="image", lower_percentile=2, upper_percentile=98),
         ]
 

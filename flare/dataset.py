@@ -23,7 +23,8 @@ from monai.transforms import (
 )
 
 from monai.data import NibabelReader
-
+import albumentations as A
+from monai.transforms import Lambdad
 import torch
 import random
 from typing import Dict, Union, List, Any
@@ -87,66 +88,6 @@ class LoadSlice(MapTransform):
         
                 
         return d
-
-class MinimalOnTheFly2DDataset(Dataset):
-    """
-    A minimal dataset that ONLY loads a 2D slice from disk and converts its type.
-    All expensive augmentations are deferred to the GPU.
-    """
-    def __init__(self, hf_dataset):
-        self.data_dicts = []
-        for item in hf_dataset:
-            if item.get('image_path') and item['image_path'] != "N/A":
-                self.data_dicts.append({
-                    "image": item['image_path'],
-                    "label": item.get('label_path', None),
-                    "label1": item.get('label_path1', None)
-                })
-
-        if not self.data_dicts:
-            raise ValueError("hf_dataset did not yield any valid image paths.")
-            
-        # This is the entire transformation pipeline for the CPU.
-        # It's fast because it does no heavy computation.
-        self.cpu_transforms = Compose([
-            LoadSlice(keys=["image", "label", "label1"]),
-            EnsureChannelFirstd(keys=["image", "label", "label1"], allow_missing_keys=True, channel_dim="no_channel"),
-            EnsureTyped(keys="image", dtype=torch.float32),
-            EnsureTyped(keys=["label", "label1"], dtype=torch.int32, allow_missing_keys=True),
-        ])
-
-    def __len__(self):
-        return len(self.data_dicts)
-
-    def __getitem__(self, idx):
-        item_dict = self.data_dicts[idx].copy()
-
-        # In training, randomly decide which pseudo-label to use (if available)
-        label_path_to_use = None
-        if item_dict["label"] != "N/A" and item_dict["label1"] != "N/A":
-            # If training with two valid labels, randomly pick one's path
-            chosen_key = random.choice(["label", "label1"])
-            label_path_to_use = item_dict[chosen_key]
-        else:
-            # For validation or if only one label exists, use the primary 'label' if available
-            label_path_to_use = item_dict.get("label", "N/A")
-        clean_dict = {
-                "image": item_dict["image"],
-                "label": label_path_to_use
-            }
-        
-        if clean_dict["label"] == "N/A":
-        # If no label, we can't use this for supervised training/validation.
-        # Here we choose to remove the key so transforms like RandCropByPosNegLabeld don't fail.
-            del clean_dict["label"]
-        
-        # MONAI's Compose pipeline handles everything from here
-        processed_data = self.cpu_transforms(clean_dict)
-        if 'label' in processed_data:
-            processed_data['label'] = processed_data['label'].long()
-            
-        return processed_data
-# --- STEP 2: The Dataset class that uses our new transform ---
 
 class OnTheFly2DDataset(Dataset):
     """
@@ -323,7 +264,11 @@ class OnTheFly2DDataset(Dataset):
         else:
             processed_data1 = self._get_contrastive_transforms()(clean_dict)
             processed_data2 = self._get_contrastive_transforms()(clean_dict)
-            return processed_data1, processed_data2
+            if "label" in processed_data1:
+                processed_data = {"image": processed_data1["image"], "label": processed_data1["label"], "image2": processed_data2["image"]}
+            else:
+                processed_data = {"image": processed_data1["image"], "image2": processed_data2["image"]}
+                return processed_data
 
 
 

@@ -1,24 +1,53 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Tuple, List
+from typing import Tuple, List, Optional
 
-# --- 1. Basic Building Blocks (Refactored for Clarity) ---
+# --- 1. Basic Building Blocks (Refactored for Clarity and Flexibility) ---
+
+def get_norm_layer(norm_type: str, num_channels: int) -> nn.Module:
+    """
+    Returns a normalization layer based on the specified type.
+
+    Args:
+        norm_type: One of 'batch', 'instance', 'group', or 'none'.
+        num_channels: Number of channels for the normalization layer.
+
+    Returns:
+        An nn.Module representing the normalization layer.
+    """
+    norm_type = norm_type.lower()
+    if norm_type == 'batch':
+        return nn.BatchNorm2d(num_channels)
+    elif norm_type == 'instance':
+        return nn.InstanceNorm2d(num_channels)
+    elif norm_type == 'group':
+        # Using 8 groups is a common default choice.
+        return nn.GroupNorm(num_groups=8, num_channels=num_channels)
+    elif norm_type == 'none':
+        return nn.Identity()
+    else:
+        raise ValueError(f"Unsupported normalization type: {norm_type}")
+
 
 class DoubleConv(nn.Module):
-    """(Convolution => GroupNorm => ReLU) * 2"""
-    def __init__(self, in_channels: int, out_channels: int, mid_channels: int = None, dropout: float = 0.0):
+    """(Convolution => Normalization => ReLU) * 2"""
+    def __init__(self, in_channels: int, out_channels: int, mid_channels: int = None,
+                 dropout: float = 0.0, norm: str = 'group'):
         super().__init__()
         if not mid_channels:
             mid_channels = out_channels
-        
+
+        # Use bias=False for conv layers when using BatchNorm, as it has its own bias (beta).
+        use_bias = norm.lower() != 'batch'
+
         self.double_conv = nn.Sequential(
-            nn.Conv2d(in_channels, mid_channels, kernel_size=3, padding=1, bias=False),
-            nn.GroupNorm(num_groups=8, num_channels=mid_channels), # Using 8 groups is a common choice
+            nn.Conv2d(in_channels, mid_channels, kernel_size=3, padding=1, bias=use_bias),
+            get_norm_layer(norm, mid_channels),
             nn.ReLU(inplace=True),
             nn.Dropout2d(p=dropout),
-            nn.Conv2d(mid_channels, out_channels, kernel_size=3, padding=1, bias=False),
-            nn.GroupNorm(num_groups=8, num_channels=out_channels),
+            nn.Conv2d(mid_channels, out_channels, kernel_size=3, padding=1, bias=use_bias),
+            get_norm_layer(norm, out_channels),
             nn.ReLU(inplace=True),
             nn.Dropout2d(p=dropout)
         )
@@ -29,68 +58,38 @@ class DoubleConv(nn.Module):
 
 class DownBlock(nn.Module):
     """Downscaling with MaxPool then DoubleConv"""
-    def __init__(self, in_channels: int, out_channels: int, dropout: float = 0.0):
+    def __init__(self, in_channels: int, out_channels: int, dropout: float = 0.0, norm: str = 'group'):
         super().__init__()
         self.maxpool_conv = nn.Sequential(
             nn.MaxPool2d(2),
-            DoubleConv(in_channels, out_channels, dropout=dropout)
+            DoubleConv(in_channels, out_channels, dropout=dropout, norm=norm)
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.maxpool_conv(x)
 
 
-class UpBlock(nn.Module):
-    """Upscaling then DoubleConv, with robust cropping"""
-    def __init__(self, in_channels: int, out_channels: int, dropout: float = 0.0):
-        super().__init__()
-        # Use ConvTranspose2d to upsample and halve the number of channels
-        self.up = nn.ConvTranspose2d(in_channels, in_channels // 2, kernel_size=2, stride=2)
-        self.conv = DoubleConv(in_channels, out_channels, dropout=dropout)
-
-    def forward(self, x1: torch.Tensor, x2: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            x1: Tensor from the previous layer (to be upsampled).
-            x2: Tensor from the corresponding skip connection (to be cropped and concatenated).
-        """
-        x1 = self.up(x1)
-        
-        # --- THIS IS THE KEY FIX ---
-        # Robust cropping for any input size.
-        # Crop the skip connection tensor (x2) to match the spatial dimensions of the upsampled tensor (x1).
-        diffY = x2.size()[2] - x1.size()[2]
-        diffX = x2.size()[3] - x1.size()[3]
-
-        x2 = F.pad(x2, [-diffX // 2, - (diffX - diffX // 2),
-                        -diffY // 2, - (diffY - diffY // 2)])
-        # -------------------------
-
-        # Concatenate along the channel dimension
-        x = torch.cat([x2, x1], dim=1)
-        return self.conv(x)
-
 class UpBlockInterpolate(nn.Module):
-    """Upscaling using interpolation, which avoids cropping entirely."""
-    def __init__(self, in_channels: int, out_channels: int, dropout: float = 0.0):
+    """Upscaling using interpolation, which avoids cropping."""
+    def __init__(self, in_channels: int, out_channels: int, dropout: float = 0.0, norm: str = 'group'):
         super().__init__()
-        # We don't need a ConvTranspose layer. We will use F.interpolate.
-        # The input to DoubleConv will be the channel count from the skip
-        # connection plus the channel count from the upsampled layer.
-        self.conv = DoubleConv(in_channels, out_channels, in_channels // 2, dropout=dropout)
+        self.conv = DoubleConv(in_channels, out_channels, in_channels // 2, dropout=dropout, norm=norm)
 
     def forward(self, x1: torch.Tensor, x2: torch.Tensor) -> torch.Tensor:
-        # Use interpolate to exactly match the size of the skip connection tensor
         x1 = F.interpolate(x1, size=x2.shape[2:], mode='bilinear', align_corners=False)
-        
-        # Concatenate along the channel dimension
         x = torch.cat([x2, x1], dim=1)
         return self.conv(x)
-    
+
+
 # --- 2. Main U-Net Architecture ---
 
-class Unet(nn.Module):
-    def __init__(self, in_channels: int, out_channels: int, channel_list: List[int] = None, dropout_rates: List[float] = None):
+class UNet(nn.Module):
+    def __init__(self,
+                 in_channels: int,
+                 out_channels: int,
+                 channel_list: Optional[List[int]] = None,
+                 dropout_rates: Optional[List[float]] = None,
+                 norm: str = 'group'):
         """
         A robust U-Net model that can handle arbitrary input sizes.
 
@@ -99,33 +98,33 @@ class Unet(nn.Module):
             out_channels: Number of output classes.
             channel_list: List of channels for each level of the U-Net.
                           Default: [64, 128, 256, 512, 1024].
-            dropout_rates: List of dropout rates for each level (4 down, 4 up).
-                           Default: [0.0, 0.0, 0.1, 0.1, 0.1, 0.1, 0.0, 0.0]
+            dropout_rates: List of dropout rates for each level (5 down, 4 up).
+                           Default: All zeros.
+            norm: Normalization type. One of 'batch', 'instance', 'group', 'none'.
+                  Default: 'group'.
         """
-        super(Unet, self).__init__()
-        
+        super(UNet, self).__init__()
+
         if channel_list is None:
             channel_list = [64, 128, 256, 512, 1024]
         if dropout_rates is None:
-            # Dropout heavier in the bottleneck
-            dropout_rates = [0.0, 0.0, 0.1, 0.1, 0.1, 0.1, 0.0, 0.0]
-            
-        assert len(dropout_rates) == 8, "dropout_rates must have 8 values (4 down, 4 up)"
+            dropout_rates = [0.0] * 9 # 5 down blocks (inc. in_conv), 4 up blocks
 
-        self.in_conv = DoubleConv(in_channels, channel_list[0], dropout=dropout_rates[0])
-        self.down1 = DownBlock(channel_list[0], channel_list[1], dropout=dropout_rates[1])
-        self.down2 = DownBlock(channel_list[1], channel_list[2], dropout=dropout_rates[2])
-        self.down3 = DownBlock(channel_list[2], channel_list[3], dropout=dropout_rates[3])
-        
-        # The downsampling factor determines the final downblock's input channels
-        factor = 2 
-        self.down4 = DownBlock(channel_list[3], channel_list[4] // factor, dropout=dropout_rates[4])
+        assert len(dropout_rates) == 9, "dropout_rates must have 9 values (1 in_conv, 4 down, 4 up)"
 
-        self.up1 = UpBlockInterpolate(channel_list[4], channel_list[3] // factor, dropout=dropout_rates[5])
-        self.up2 = UpBlockInterpolate(channel_list[3], channel_list[2] // factor, dropout=dropout_rates[6])
-        self.up3 = UpBlockInterpolate(channel_list[2], channel_list[1] // factor, dropout=dropout_rates[7])
-        self.up4 = UpBlockInterpolate(channel_list[1], channel_list[0]) # No dropout on last up block
-        
+        self.in_conv = DoubleConv(in_channels, channel_list[0], dropout=dropout_rates[0], norm=norm)
+        self.down1 = DownBlock(channel_list[0], channel_list[1], dropout=dropout_rates[1], norm=norm)
+        self.down2 = DownBlock(channel_list[1], channel_list[2], dropout=dropout_rates[2], norm=norm)
+        self.down3 = DownBlock(channel_list[2], channel_list[3], dropout=dropout_rates[3], norm=norm)
+
+        factor = 2
+        self.down4 = DownBlock(channel_list[3], channel_list[4] // factor, dropout=dropout_rates[4], norm=norm)
+
+        self.up1 = UpBlockInterpolate(channel_list[4], channel_list[3] // factor, dropout=dropout_rates[5], norm=norm)
+        self.up2 = UpBlockInterpolate(channel_list[3], channel_list[2] // factor, dropout=dropout_rates[6], norm=norm)
+        self.up3 = UpBlockInterpolate(channel_list[2], channel_list[1] // factor, dropout=dropout_rates[7], norm=norm)
+        self.up4 = UpBlockInterpolate(channel_list[1], channel_list[0], dropout=dropout_rates[8], norm=norm)
+
         self.out_conv = nn.Conv2d(channel_list[0], out_channels, kernel_size=1)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -134,17 +133,17 @@ class Unet(nn.Module):
         x3 = self.down2(x2)
         x4 = self.down3(x3)
         x5 = self.down4(x4)
-        
+
         x = self.up1(x5, x4)
         x = self.up2(x, x3)
         x = self.up3(x, x2)
         x = self.up4(x, x1)
-        
+
         logits = self.out_conv(x)
         return logits
 
 # --- 3. SimCLR Variant using the Robust Blocks ---
-# Your original projector classes (can be kept as is or cleaned up)
+# (Your original SimCLR/Projector code can remain here, just ensure you pass the `norm` param if needed)
 class Flatten(nn.Module):
     def forward(self, x):
         return x.view(x.size(0), -1)
@@ -152,7 +151,6 @@ class Flatten(nn.Module):
 class Projector(nn.Module):
     def __init__(self, in_channels: int, proj_hidden_dim: int, proj_output_dim: int):
         super().__init__()
-        # Use Global Average Pooling to be robust to feature map size
         self.projector_head = nn.Sequential(
             nn.AdaptiveAvgPool2d((1, 1)),
             Flatten(),
@@ -164,36 +162,18 @@ class Projector(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.projector_head(x)
 
-class Projector_CH_1(nn.Module):
-    def __init__(self, in_channels, out_channels=1):
-        super(Projector_CH_1, self).__init__()
-        self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=1)
-        self.instance_norm = nn.InstanceNorm2d(out_channels)
-        self.relu = nn.ReLU()
-        self.projector_layer = nn.Sequential(
-        Flatten(),
-        nn.Linear(1024, 128),
-        nn.ReLU(),
-        nn.Linear(128, 128),
-        )
-
-def forward(self, x):
-    x = self.relu(self.instance_norm(self.conv1(x)))
-    x = self.projector_layer(x)
-    return x
-
 class Unet_SegCLR(nn.Module):
     """A U-Net model with a SimCLR projection head on the encoder's bottleneck."""
-    def __init__(self, in_channels: int, out_channels: int, proj_output_dim: int = 128):
+    def __init__(self, in_channels: int, out_channels: int, proj_output_dim: int = 128, norm: str = 'group'):
         super().__init__()
-        # We can reuse the standard Unet and just 'intercept' the forward pass
-        self.unet = Unet(in_channels, out_channels)
+        # Pass the norm choice to the underlying U-Net
+        self.unet = UNet(in_channels, out_channels, norm=norm)
         
         # The projector attaches to the bottleneck, which has channel_list[4] channels
         bottleneck_channels = 1024 # Based on default channel list
         self.projector = Projector(
-            in_channels=bottleneck_channels // 2, 
-            proj_hidden_dim=512, 
+            in_channels=bottleneck_channels // 2,
+            proj_hidden_dim=512,
             proj_output_dim=proj_output_dim
         )
 
@@ -218,28 +198,41 @@ class Unet_SegCLR(nn.Module):
         
         return z, logits
 
-# --- 4. Testing the Robustness ---
+# --- 4. Testing the Robustness and Flexibility ---
 if __name__ == "__main__":
-    # Test with a standard size (divisible by 16)
-    print("--- Testing with standard size (256x256) ---")
-    net = Unet(in_channels=1, out_channels=3)
-    standard_input = torch.randn(2, 1, 256, 256)
-    standard_output = net(standard_input)
-    print(f"Input shape: {standard_input.shape}")
-    print(f"Output shape: {standard_output.shape}\n") # Should be (2, 3, 256, 256)
-
-    # Test with a non-standard, odd-numbered size
+    # --- Test 1: Robustness to input size ---
     print("--- Testing with non-standard size (251x387) ---")
+    net_group = UNet(in_channels=1, out_channels=3) # Uses default GroupNorm
     non_standard_input = torch.randn(2, 1, 251, 387)
-    non_standard_output = net(non_standard_input)
+    non_standard_output = net_group(non_standard_input)
     print(f"Input shape: {non_standard_input.shape}")
     print(f"Output shape: {non_standard_output.shape}") # Should be (2, 3, 251, 387)
     print("Test successful: Model is robust to arbitrary input sizes.")
+
+    # --- Test 2: Flexibility of Normalization ---
+    print("\n--- Testing different normalization layers ---")
+
+    # Batch Norm
+    net_batch = UNet(in_channels=1, out_channels=3, norm='batch')
+    print("\nModel with BatchNorm2d:")
+    # print(net_batch) # Uncomment to see the full architecture
+    assert isinstance(net_batch.in_conv.double_conv[1], nn.BatchNorm2d)
+    print("Successfully created U-Net with Batch Normalization.")
+
+    # Instance Norm
+    net_instance = UNet(in_channels=1, out_channels=3, norm='instance')
+    assert isinstance(net_instance.in_conv.double_conv[1], nn.InstanceNorm2d)
+    print("Successfully created U-Net with Instance Normalization.")
+
+    # No Norm
+    net_none = UNet(in_channels=1, out_channels=3, norm='none')
+    assert isinstance(net_none.in_conv.double_conv[1], nn.Identity)
+    print("Successfully created U-Net with no normalization (Identity).")
     
-    # Test SimCLR variant
-    print("\n--- Testing Unet_SegCLR with non-standard size (251x387) ---")
-    simclr_net = Unet_SegCLR(in_channels=1, out_channels=3)
+    # --- Test 3: SimCLR variant ---
+    print("\n--- Testing Unet_SegCLR with Batch Norm ---")
+    simclr_net = Unet_SegCLR(in_channels=1, out_channels=3, norm='batch')
     z, logits = simclr_net(non_standard_input)
     print(f"Projection Vector (z) shape: {z.shape}") # Should be (2, 128)
     print(f"Segmentation Logits shape: {logits.shape}") # Should be (2, 3, 251, 387)
-    print("Test successful: Unet_SegCLR is also robust.")
+    print("Test successful: Unet_SegCLR is also robust and flexible.")

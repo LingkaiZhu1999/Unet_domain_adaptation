@@ -106,7 +106,7 @@ class UNet(nn.Module):
             # This list now correctly results in a 1024-channel bottleneck
             channel_list = [64, 128, 256, 512, 1024]
         if dropout_rates is None:
-            dropout_rates = [0.0, 0.0, 0.1, 0.2, 0.3, 0.2, 0.1, 0.0, 0.0]
+            dropout_rates = [0.0, 0.0, 0.0, 0.5, 0.5, 0.5, 0.5, 0.0, 0.0]
 
         assert len(dropout_rates) == 9, "dropout_rates must have 9 values (1 in_conv, 4 down, 4 up)"
 

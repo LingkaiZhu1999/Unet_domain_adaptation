@@ -231,6 +231,7 @@ class OnTheFly2DDataset(Dataset):
             allow_missing_keys=True
                 ),
             ClipIntensityPercentiled(keys="image", lower_percentile=2, upper_percentile=98),
+            SafeNormalizeIntensityd(keys="image", nonzero=True, channel_wise=True)
         ]
 
     def _get_weak_transforms(self):
@@ -245,7 +246,6 @@ class OnTheFly2DDataset(Dataset):
             ])
         else: # For validation, just resize.
             xforms.append(ResizeWithPadOrCropd(keys=["image", "label"], spatial_size=self.patch_size, allow_missing_keys=True))
-            
         xforms.append(SafeNormalizeIntensityd(keys="image", nonzero=True, channel_wise=True))
         return Compose(xforms)
 
@@ -265,12 +265,15 @@ class OnTheFly2DDataset(Dataset):
 
         xforms = self._get_base_transforms()
         xforms.extend([
+            ResizeWithPadOrCropd(keys=["image", "label"], spatial_size=self.patch_size, allow_missing_keys=True),
+            RandFlipd(keys=["image", "label"], prob=0.5, spatial_axis=1, allow_missing_keys=True), # Horizontal flip
+            RandRotate90d(keys=["image", "label"], prob=0.5, max_k=3, spatial_axes=(0, 1), allow_missing_keys=True),
             RandAffined(
                 keys=["image", "label"],
-                prob=0.9,
-                scale_range=((0.7, 1.5), (0.7, 1.5)), 
+                prob=0.8,
+                scale_range=((0.8, 1.2), (0.8, 1.2)), 
                 translate_range=(self.patch_size[0] * 0.25, self.patch_size[1] * 0.25),
-                rotate_range=(np.pi / 6,), # Rotate up to 30 degrees
+                rotate_range=(np.pi / 12,), # Rotate up to 30 degrees
                 mode=("bilinear", "nearest"),
                 padding_mode="reflection",
                 allow_missing_keys=True
@@ -299,43 +302,28 @@ class OnTheFly2DDataset(Dataset):
         if clean_dict["label"] == "N/A":
             del clean_dict["label"]
 
-        # --- Apply the correct pipelines ---
-        processed_data1 = self.weak_transforms(clean_dict)
-      # --- FIX: Create label tensor and flag ---
-        if "label" in processed_data1:
-            label_tensor = processed_data1["label"]
-            # Add a channel dimension if your label is (H, W) to make it (1, H, W)
-            # This is often needed for batching. Adjust if your labels are already channeled.
-            if label_tensor.ndim == 2:
-                 label_tensor = label_tensor.unsqueeze(0)
-            has_label = torch.tensor(True)
-        else:
-            # Create a placeholder tensor with the correct shape and type
-            # The shape should be (C, H, W). Here we assume C=1.
-            label_tensor = torch.zeros((1, self.patch_size[0], self.patch_size[1]), dtype=torch.int8)
-            has_label = torch.tensor(False)
-
-        # --- FIX: Construct the final dictionary with consistent keys ---
         if self.is_contrastive:
-            # Note: For consistency, always process the same dict for both views
-            # Here we re-process the original image dict for strong transforms
-            processed_data2 = self.strong_transforms({"image": item_dict["image"]})
-
+            processed_data1 = self.strong_transforms(clean_dict)
+            processed_data2 = self.strong_transforms(clean_dict)
             return {
                 "image": processed_data1["image"],
                 "image2": processed_data2["image"],
-                "label": label_tensor,
-                "has_label": has_label  # This flag is crucial for your training loop
+                "label": processed_data1["label"] if "label" in processed_data1 else torch.tensor([]),
             }
-        else: # Non-contrastive case
-            return {
-                "image": processed_data1["image"],
-                "label": label_tensor,
-                "has_label": has_label
-            }
+        else: 
 
+            processed_data1 = self.weak_transforms(clean_dict)
 
+            if "label" in processed_data1:
+                label_tensor = processed_data1["label"]
 
+                if label_tensor.ndim == 2:
+                    label_tensor = label_tensor.unsqueeze(0)
+            else:
+                return {
+                    "image": processed_data1["image"],
+                    "label": torch.tensor([]),  # Empty tensor if no label
+                }
 
 
 

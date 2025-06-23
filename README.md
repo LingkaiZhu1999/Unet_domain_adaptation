@@ -7,3 +7,6 @@ The code for the paper Unsupervised Domain Adaptation with Contrastive Learning 
 # Brain Tumor Segmentation Challenge
 ./brats
 
+# FLARE
+./flare
+

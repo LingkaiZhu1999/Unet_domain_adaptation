@@ -195,10 +195,11 @@ class OnTheFly2DDataset(Dataset):
     An efficient 2D Dataset that loads slices on-the-fly.
     Generates two different augmented views for contrastive learning if enabled.
     """
-    def __init__(self, hf_dataset, patch_size=(224, 192), is_train=True, is_contrastive=False):
+    def __init__(self, hf_dataset, patch_size=(224, 192), is_train=True, is_contrastive=False, has_label=True):
         self.is_train = is_train
         self.patch_size = patch_size
         self.is_contrastive = is_contrastive
+        self.has_label = has_label
 
         self.data_dicts = []
         for item in hf_dataset:
@@ -305,24 +306,29 @@ class OnTheFly2DDataset(Dataset):
         if self.is_contrastive:
             processed_data1 = self.strong_transforms(clean_dict)
             processed_data2 = self.strong_transforms(clean_dict)
-            return {
-                "image": processed_data1["image"],
-                "image2": processed_data2["image"],
-                "label": processed_data1["label"] if "label" in processed_data1 else torch.tensor([]),
-            }
-        else: 
-
-            processed_data1 = self.weak_transforms(clean_dict)
-
-            if "label" in processed_data1:
-                label_tensor = processed_data1["label"]
-
-                if label_tensor.ndim == 2:
-                    label_tensor = label_tensor.unsqueeze(0)
+            if self.has_label and "label" in processed_data1:
+                return {
+                    "image": processed_data1["image"],
+                    "image2": processed_data2["image"],
+                    "label": processed_data1["label"],
+                }
             else:
                 return {
                     "image": processed_data1["image"],
-                    "label": torch.tensor([]),  # Empty tensor if no label
+                    "image2": processed_data2["image"],
+                    "label": torch.tensor([]),
+                }
+        else: 
+            processed_data1 = self.weak_transforms(clean_dict)
+            if self.has_label and "label" in processed_data1:
+                return {
+                    "image": processed_data1["image"],
+                    "label": processed_data1["label"],
+                }
+            else:
+                return {
+                    "image": processed_data1["image"],
+                    "label": torch.tensor([]), 
                 }
 
 
@@ -443,12 +449,12 @@ class Flare3DPatchDataset(Dataset):
 if __name__ == "__main__":
 #     # Assuming hf_dataset is already defined and loaded
     patch_size = (224, 192)  # Example patch size
-    hf_dataset = load_dataset("./local_flare_loader.py", name="train_ct_pseudo", data_dir="/scratch/work/zhul2/data/FLARE-MedFM/FLARE-Task3-DomainAdaption", trust_remote_code=True)["train"]
-    dataset = OnTheFly2DDataset(hf_dataset, patch_size=patch_size, is_train=True, is_contrastive=True)
+    hf_dataset = load_dataset("./local_flare_loader.py", name="validation_mri", data_dir="/scratch/work/zhul2/data/FLARE-MedFM/FLARE-Task3-DomainAdaption", trust_remote_code=True)["train"]
+    dataset = OnTheFly2DDataset(hf_dataset, patch_size=patch_size, is_train=False, is_contrastive=False, has_label=True)
     print(f"Dataset length: {len(dataset)}")
     for i in range(len(dataset)):
         samples = dataset[i]
-        print(samples["image"].shape, samples["label"].shape, samples["image2"].shape)
+        print(samples["image"].shape, samples["label"].shape)
         break
         # if len(torch.unique(sample['label'])) > 14:
         #     print(f"Sample {i} has more than 14 classes in label: {torch.unique(sample['label'])}")

@@ -389,7 +389,7 @@ class OnTheFly2DDataset(Dataset):
             ), 
 
             # Lambdad(keys="image", func=apply_albumentations), # might be a bug here.
-            # ResizeWithPadOrCropd(keys=["image", "label"], spatial_size=self.patch_size, allow_missing_keys=True),
+            ResizeWithPadOrCropd(keys=["image", "label"], spatial_size=self.patch_size, allow_missing_keys=True), # just in case the previous transforms changed the size
             SafeNormalizeIntensityd(keys="image", nonzero=True, channel_wise=True),
         ])
         return Compose(xforms)
@@ -430,10 +430,10 @@ class OnTheFly2DDataset(Dataset):
                 }
         else: 
             processed_data1 = self.weak_transforms(self.base_transforms(clean_dict))
-            if self.has_label and "label" in processed_data1[0]:
+            if self.has_label and "label" in processed_data1:
                 return {
-                    "image": processed_data1[0]["image"],
-                    "label": processed_data1[0]["label"],
+                    "image": processed_data1["image"],
+                    "label": processed_data1["label"],
                 }
             else:
                 return {
@@ -557,14 +557,14 @@ class Flare3DPatchDataset(Dataset):
 # Example usage:
 if __name__ == "__main__":
 #     # Assuming hf_dataset is already defined and loaded
-    patch_size = (400, 400)  # Example patch size
-    hf_dataset = load_dataset("./local_flare_loader.py", name="train_ct_gt", data_dir="/scratch/work/zhul2/data/FLARE-MedFM/FLARE-Task3-DomainAdaption", trust_remote_code=True)["train"]
-    dataset = OnTheFly2DDataset(hf_dataset, patch_size=patch_size, is_train=True, is_contrastive=True, has_label=True)
-    print(f"Dataset length: {len(dataset)}")
+    patch_size = (1000, 1000)  # Example patch size
+    hf_dataset = load_dataset("./local_flare_loader.py", name="train_ct_pseudo", data_dir="/scratch/work/zhul2/data/FLARE-MedFM/FLARE-Task3-DomainAdaption", trust_remote_code=True)["train"]
+    dataset = OnTheFly2DDataset(hf_dataset, patch_size=patch_size, is_train=False, is_contrastive=False, has_label=True)
+
     for i in range(len(dataset)):
         samples = dataset[i]
         print(samples["image"].shape, samples["label"].shape)
-        print(torch.unique(samples["image"]))
+        print(torch.unique(samples["image"]).shape)
         # visualize the first sample and label
         if i == 0:
             import matplotlib.pyplot as plt
@@ -580,7 +580,7 @@ if __name__ == "__main__":
                 plt.axis('off')
             plt.show()
             plt.savefig("sample_image_label.png")
-        break
+        
         # if len(torch.unique(sample['label'])) > 14:
         #     print(f"Sample {i} has more than 14 classes in label: {torch.unique(sample['label'])}")
         # Print the shapes of the image and label tensors

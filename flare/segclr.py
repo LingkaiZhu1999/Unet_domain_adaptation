@@ -81,10 +81,10 @@ def train_epoch_segclr(model, source_loader, target_iterator, optimizer, sup_cri
 
         with autocast(device_type=device.type, dtype=torch.float16):
             # --- Forward passes for all 4 images ---
-            zs1, logits_s1 = model(s_img1) # Supervised + Contrastive
-            zs2, _         = model(s_img2) # Contrastive only
-            zt1, _         = model(t_img1) # Contrastive only
-            zt2, _         = model(t_img2) # Contrastive only
+            zs1, logits_s1 = model(s_img1, has_label=True) # Supervised + Contrastive
+            zs2, _         = model(s_img2, has_label=False) # Contrastive only
+            zt1, _         = model(t_img1, has_label=False) # Contrastive only
+            zt2, _         = model(t_img2, has_label=False) # Contrastive only
 
             # --- Loss Calculation ---
             # 1. Supervised Loss (on source domain, first view)
@@ -170,7 +170,7 @@ def main():
     if True:
         print("Using 2D model.")
         from dataset import OnTheFly2DDataset as FlarePatchDataset
-        PATCH_SIZE_TRAIN = (480, 480)
+        PATCH_SIZE_TRAIN = (512, 512)
         PATCH_SIZE_VAL = (480, 480)  
 
     # --- Setup Directories and Seeds ---

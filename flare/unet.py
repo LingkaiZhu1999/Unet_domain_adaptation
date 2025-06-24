@@ -200,7 +200,7 @@ class Projector_Conv(nn.Module):
 class Unet_SegCLR(nn.Module):
     """A U-Net model with a SimCLR projection head on the encoder's bottleneck."""
     def __init__(self, in_channels: int, out_channels: int, proj_output_dim: int = 128, norm: str = 'instance', deep_supervision: bool = False,
-                 proj_hidden_dim: int = 30*30):
+                 proj_hidden_dim: int = 1024):
         super().__init__()
         # <<< --- PASS DEEP SUPERVISION FLAG TO UNET ---
         self.unet = UNet(in_channels, out_channels, norm=norm, deep_supervision=deep_supervision)
@@ -259,7 +259,7 @@ if __name__ == "__main__":
     # <<< --- ADDED TEST FOR DEEP SUPERVISION ---
     print("\n--- Testing U-Net with Deep Supervision ---")
     ds_net = UNet(in_channels=1, out_channels=14, deep_supervision=True).to(device)
-    standard_input = torch.randn(2, 1, 480, 480).to(device)  # Batch size of 50, 1 channel, 480x480 resolution
+    standard_input = torch.randn(2, 1, 512, 512).to(device)  # Batch size of 50, 1 channel, 480x480 resolution
     ds_outputs = ds_net(standard_input)
 
     assert isinstance(ds_outputs, list), "Output should be a list for deep supervision"
@@ -277,5 +277,5 @@ if __name__ == "__main__":
     z, logits_list = ds_segclr_net(standard_input, has_label=False)
     # assert isinstance(logits_list, list) and len(logits_list) == 4
     print(f"Projection Vector (z) shape: {z.shape}") # Should be (2, 128)
-    print(f"Segmentation Logits is a list of {len(logits_list)} tensors.")
+    # print(f"Segmentation Logits is a list of {len(logits_list)} tensors.")
     print("Test successful: Models are robust to deep supervision flag.")

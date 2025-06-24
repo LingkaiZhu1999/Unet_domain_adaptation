@@ -28,7 +28,10 @@ from monai.transforms import (
     RandGaussianSmoothd,
     RandAdjustContrastd,
     RandomOrder,
-    RandCoarseDropoutd
+    RandCoarseDropoutd,
+    CropForegroundd,
+    RandCropByPosNegLabeld,
+    Resized
 )
 
 from monai.data import NibabelReader
@@ -96,6 +99,7 @@ class ClipIntensityPercentiled(MapTransform):
         super().__init__(keys, allow_missing_keys=True)
         self.lower_p = lower_percentile
         self.upper_p = upper_percentile
+        assert 0 <= self.lower_p < self.upper_p <= 100, "Percentiles must be in the range [0, 100] and lower < upper."
 
     def __call__(self, data: Dict[str, Any]) -> Dict[str, Any]:
         d = dict(data)
@@ -143,10 +147,9 @@ class LoadSlice(MapTransform):
         """Finds indices of non-blank slices using vectorized numpy."""
         # Sum over the spatial dimensions (H, W) of the slices
         sum_axes = tuple(i for i in range(volume_np.ndim) if i != self.np_axis)
-        # slice_sums = np.sum(volume_np, axis=sum_axes)
-        # Get the indices where the sum is greater than 0
+        # count unique
         slice_stds = np.std(volume_np, axis=sum_axes)
-        return np.where(slice_stds > 0.1)[0]
+        return np.where(slice_stds > 0.5)[0]
 
     def __call__(self, data: Dict[str, Any]) -> Dict[str, Any]:
         d = dict(data)
@@ -232,7 +235,7 @@ class OnTheFly2DDataset(Dataset):
             func=lambda x: torch.clamp(x, min=0, max=NUM_CLASSES - 1),
             allow_missing_keys=True
                 ),
-            ClipIntensityPercentiled(keys="image", lower_percentile=2, upper_percentile=98),
+            ClipIntensityPercentiled(keys="image", lower_percentile=0.5, upper_percentile=99.5),
         ])
 
     def _get_weak_transforms(self):
@@ -265,13 +268,24 @@ class OnTheFly2DDataset(Dataset):
             return torch.from_numpy(augmented).unsqueeze(0)  # Add channel dimension back
 
         xforms = []
+        prob_intensity_appearance = 0.5
+        prob_shape = 0.5
+        prob_noise = 0.2
+        # xforms.extend([Resized(spatial_size=(int(self.patch_size[0]*1.25), int(self.patch_size[0]*1.25)), keys=["image", "label"], allow_missing_keys=True)])
+        # if self.has_label:
+        #     xforms.extend([RandCropByPosNegLabeld(keys=["image", "label"], spatial_size=self.patch_size, label_key="label", allow_missing_keys=True)])
+        # else:
+        #     xforms.extend([CropForegroundd(keys=["image", "label"], source_key="image", roi_size=self.patch_size, allow_missing_keys=True)])
+        
         xforms.extend([
             ResizeWithPadOrCropd(keys=["image", "label"], spatial_size=self.patch_size, allow_missing_keys=True),
-            RandFlipd(keys=["image", "label"], prob=0.5, spatial_axis=1, allow_missing_keys=True), # Horizontal flip
+            # CropForegroundd(keys=["image", "label"], source_key="label", allow_missing_keys=True),
+
+            RandFlipd(keys=["image", "label"], prob=prob_shape, spatial_axis=1, allow_missing_keys=True), # Horizontal flip
             RandRotate90d(keys=["image", "label"], prob=0.5, max_k=3, spatial_axes=(0, 1), allow_missing_keys=True),
             RandAffined(
                 keys=["image", "label"],
-                prob=0.6,
+                prob=prob_shape,
                 scale_range=((0, 0.15), (0, 0.15)), # Scale up to 15%
                 translate_range=(self.patch_size[0] * 0.15, self.patch_size[1] * 0.15),
                 rotate_range=(np.pi / 12,), # Rotate up to 30 degrees
@@ -280,23 +294,22 @@ class OnTheFly2DDataset(Dataset):
                 allow_missing_keys=True
             ),
             # --- Intensity and Appearance Augmentations (applied in a random order) ---
-             
             RandomOrder([
-            RandGaussianSmoothd(keys="image", sigma_x=(1, 2), sigma_y=(1, 2), prob=0.33),
-            RandScaleIntensityd(keys="image", factors=0.1, prob=0.33),
-            RandAdjustContrastd(keys="image", gamma=(0.75, 1.25), prob=0.33),
+            RandGaussianSmoothd(keys="image", sigma_x=(1, 2), sigma_y=(1, 2), prob=prob_intensity_appearance),
+            RandScaleIntensityd(keys="image", factors=0.1, prob=prob_intensity_appearance),
+            RandAdjustContrastd(keys="image", gamma=(0.75, 1.25), prob=prob_intensity_appearance),
             ]),
             
              # --- Noise and Dropout ---
-            RandGaussianNoised(keys="image", std=0.1, prob=0.2),
-            RandCoarseDropoutd(
-                keys=["image", "label"],
-                holes=1, max_holes=3,
-                spatial_size=(8, 8), max_spatial_size=(16, 16),
-                fill_value=0, # Use 0 for background
-                prob=0.5,
-                allow_missing_keys=True
-            ), 
+            RandGaussianNoised(keys="image", std=0.1, prob=prob_noise),
+            # RandCoarseDropoutd(
+            #     keys=["image", "label"],
+            #     holes=1, max_holes=3,
+            #     spatial_size=(8, 8), max_spatial_size=(16, 16),
+            #     fill_value=0, # Use 0 for background
+            #     prob=0.5,
+            #     allow_missing_keys=True
+            # ), 
 
             # Lambdad(keys="image", func=apply_albumentations), # might be a bug here.
             # ResizeWithPadOrCropd(keys=["image", "label"], spatial_size=self.patch_size, allow_missing_keys=True),
@@ -467,14 +480,15 @@ class Flare3DPatchDataset(Dataset):
 # Example usage:
 if __name__ == "__main__":
 #     # Assuming hf_dataset is already defined and loaded
-    patch_size = (480, 480)  # Example patch size
-    hf_dataset = load_dataset("./local_flare_loader.py", name="train_mri_unlabeled", data_dir="/scratch/work/zhul2/data/FLARE-MedFM/FLARE-Task3-DomainAdaption", trust_remote_code=True)["train"]
+    patch_size = (400, 400)  # Example patch size
+    hf_dataset = load_dataset("./local_flare_loader.py", name="train_ct_gt", data_dir="/scratch/work/zhul2/data/FLARE-MedFM/FLARE-Task3-DomainAdaption", trust_remote_code=True)["train"]
     dataset = OnTheFly2DDataset(hf_dataset, patch_size=patch_size, is_train=True, is_contrastive=True, has_label=True)
     print(f"Dataset length: {len(dataset)}")
     for i in range(len(dataset)):
         samples = dataset[i]
         print(samples["image"].shape, samples["label"].shape)
         print(torch.unique(samples["image"]))
+        print(samples["image"])
         # visualize the first sample and label
         if i == 0:
             import matplotlib.pyplot as plt

@@ -3,6 +3,9 @@ import torch
 from monai.data import Dataset
 import SimpleITK as sitk
 import warnings
+import numpy as np
+import random
+from typing import Dict, Any, Optional
 warnings.filterwarnings("ignore", ".*unexpected scales in sform.*")
 # Import the necessary 3D-capable MONAI transforms
 from monai.transforms import (
@@ -22,6 +25,10 @@ from monai.transforms import (
     Pad,
     ResizeWithPadOrCropd,
     RandRotate90d,
+    RandGaussianSmoothd,
+    RandAdjustContrastd,
+    RandomOrder,
+    RandCoarseDropoutd
 )
 
 from monai.data import NibabelReader
@@ -109,18 +116,8 @@ class ClipIntensityPercentiled(MapTransform):
                 # Clip the image tensor to the calculated bounds
                 d[key] = torch.clamp(img_tensor, lower_bound, upper_bound)
         return d
-    
-import SimpleITK as sitk
-import numpy as np
-import random
-from typing import Dict, Any, Optional
-from monai.transforms import MapTransform
 
-import SimpleITK as sitk
-import numpy as np
-import random
-from typing import Dict, Any
-from monai.transforms import MapTransform
+
 
 class LoadSlice(MapTransform):
     """
@@ -146,44 +143,47 @@ class LoadSlice(MapTransform):
         """Finds indices of non-blank slices using vectorized numpy."""
         # Sum over the spatial dimensions (H, W) of the slices
         sum_axes = tuple(i for i in range(volume_np.ndim) if i != self.np_axis)
-        slice_sums = np.sum(volume_np, axis=sum_axes)
+        # slice_sums = np.sum(volume_np, axis=sum_axes)
         # Get the indices where the sum is greater than 0
-        return np.where(slice_sums > 0)[0]
+        slice_stds = np.std(volume_np, axis=sum_axes)
+        return np.where(slice_stds > 0.1)[0]
 
     def __call__(self, data: Dict[str, Any]) -> Dict[str, Any]:
         d = dict(data)
         
-        # --- Step 1: Load all required volumes into memory first ---
-        # This minimizes disk I/O to one read per file path.
+        # --- Step 1: Load all required sitk volumes ---
         sitk_volumes = {
             key: sitk.ReadImage(d[key]) 
             for key in self.keys if key in d and d[key] != 'N/A'
         }
+
+        # --- Step 2: Convert all volumes to NumPy arrays ONCE ---
+        # This is much more efficient than repeated conversions.
+        np_volumes = {
+            key: sitk.GetArrayFromImage(vol) for key, vol in sitk_volumes.items()
+        }
         
-        # --- Step 2: Determine the best set of valid slice indices ---
+        # --- Step 3: Determine the best set of valid slice indices ---
         valid_indices = []
         # Prioritize finding a slice with a label
-        if self.label_key in sitk_volumes:
-            label_np = sitk.GetArrayFromImage(sitk_volumes[self.label_key])
-            valid_indices = self._get_valid_indices(label_np)
+        if self.label_key in np_volumes:
+            valid_indices = self._get_valid_indices(np_volumes[self.label_key])
         
         # If no labeled slices are found (or no label exists), fallback to image
-        if len(valid_indices) == 0 and 'image' in sitk_volumes:
-            image_np = sitk.GetArrayFromImage(sitk_volumes['image'])
-            valid_indices = self._get_valid_indices(image_np)
+        if len(valid_indices) == 0:
+            valid_indices = self._get_valid_indices(np_volumes['image'])
         
-        # --- Step 3: Choose a slice index ---
+        # --- Step 4: Choose a slice index ---
         if len(valid_indices) > 0:
-            # Randomly choose from the list of good slices
             slice_idx = random.choice(valid_indices)
         else:
-            # Last resort: if the entire volume is blank, just pick a random slice
+            # Fallback: if entire volume is blank, get depth from original sitk object
+            # Using 'image' as the reference for size.
             depth = sitk_volumes['image'].GetSize()[self.axis]
             slice_idx = random.randint(0, depth - 1)
             
-        # --- Step 4: Extract the chosen slice from each volume ---
-        for key, sitk_vol in sitk_volumes.items():
-            volume_np = sitk.GetArrayFromImage(sitk_vol)
+        # --- Step 5: Extract the chosen slice from each NumPy volume ---
+        for key, volume_np in np_volumes.items():
             # Use np.take to select the slice along the correct axis
             d[key] = np.take(volume_np, slice_idx, axis=self.np_axis)
                 
@@ -213,6 +213,7 @@ class OnTheFly2DDataset(Dataset):
         if not self.data_dicts:
             raise ValueError("hf_dataset did not yield any valid image paths.")
 
+        self.base_transforms = self._get_base_transforms()
         # --- Initialize two distinct transform pipelines ---
         self.weak_transforms = self._get_weak_transforms()
         if self.is_contrastive:
@@ -221,7 +222,7 @@ class OnTheFly2DDataset(Dataset):
     def _get_base_transforms(self):
         """Common transforms for both pipelines (loading and initial formatting)."""
 
-        return [
+        return Compose([
             LoadSlice(keys=["image", "label"]),
             EnsureChannelFirstd(keys=["image", "label"], channel_dim="no_channel", allow_missing_keys=True),
             EnsureTyped(keys="image", dtype=torch.float32),
@@ -232,13 +233,12 @@ class OnTheFly2DDataset(Dataset):
             allow_missing_keys=True
                 ),
             ClipIntensityPercentiled(keys="image", lower_percentile=2, upper_percentile=98),
-            SafeNormalizeIntensityd(keys="image", nonzero=True, channel_wise=True)
-        ]
+        ])
 
     def _get_weak_transforms(self):
         """Standard augmentations for training (view x) or validation."""
-        xforms = self._get_base_transforms()
-        
+        xforms = []
+
         if self.is_train:
             xforms.extend([
                 ResizeWithPadOrCropd(keys=["image", "label"], spatial_size=self.patch_size, allow_missing_keys=True),
@@ -264,24 +264,42 @@ class OnTheFly2DDataset(Dataset):
             augmented = albumentations_xforms(image=img_numpy)['image']
             return torch.from_numpy(augmented).unsqueeze(0)  # Add channel dimension back
 
-        xforms = self._get_base_transforms()
+        xforms = []
         xforms.extend([
             ResizeWithPadOrCropd(keys=["image", "label"], spatial_size=self.patch_size, allow_missing_keys=True),
             RandFlipd(keys=["image", "label"], prob=0.5, spatial_axis=1, allow_missing_keys=True), # Horizontal flip
             RandRotate90d(keys=["image", "label"], prob=0.5, max_k=3, spatial_axes=(0, 1), allow_missing_keys=True),
             RandAffined(
                 keys=["image", "label"],
-                prob=0.8,
-                scale_range=((0.8, 1.2), (0.8, 1.2)), 
-                translate_range=(self.patch_size[0] * 0.25, self.patch_size[1] * 0.25),
+                prob=0.6,
+                scale_range=((0, 0.15), (0, 0.15)), # Scale up to 15%
+                translate_range=(self.patch_size[0] * 0.15, self.patch_size[1] * 0.15),
                 rotate_range=(np.pi / 12,), # Rotate up to 30 degrees
                 mode=("bilinear", "nearest"),
                 padding_mode="reflection",
                 allow_missing_keys=True
             ),
-            ResizeWithPadOrCropd(keys=["image", "label"], spatial_size=self.patch_size, allow_missing_keys=True),
-            Lambdad(keys="image", func=apply_albumentations),
-            RandGaussianNoised(keys="image", std=0.1, prob=0.1),
+            # --- Intensity and Appearance Augmentations (applied in a random order) ---
+             
+            RandomOrder([
+            RandGaussianSmoothd(keys="image", sigma_x=(1, 2), sigma_y=(1, 2), prob=0.33),
+            RandScaleIntensityd(keys="image", factors=0.1, prob=0.33),
+            RandAdjustContrastd(keys="image", gamma=(0.75, 1.25), prob=0.33),
+            ]),
+            
+             # --- Noise and Dropout ---
+            RandGaussianNoised(keys="image", std=0.1, prob=0.2),
+            RandCoarseDropoutd(
+                keys=["image", "label"],
+                holes=1, max_holes=3,
+                spatial_size=(8, 8), max_spatial_size=(16, 16),
+                fill_value=0, # Use 0 for background
+                prob=0.5,
+                allow_missing_keys=True
+            ), 
+
+            # Lambdad(keys="image", func=apply_albumentations), # might be a bug here.
+            # ResizeWithPadOrCropd(keys=["image", "label"], spatial_size=self.patch_size, allow_missing_keys=True),
             SafeNormalizeIntensityd(keys="image", nonzero=True, channel_wise=True),
         ])
         return Compose(xforms)
@@ -304,8 +322,10 @@ class OnTheFly2DDataset(Dataset):
             del clean_dict["label"]
 
         if self.is_contrastive:
-            processed_data1 = self.strong_transforms(clean_dict)
-            processed_data2 = self.strong_transforms(clean_dict)
+            processed_data = self.base_transforms(clean_dict)
+            # Apply the strong transforms to generate two augmented views
+            processed_data1 = self.strong_transforms(processed_data)
+            processed_data2 = self.strong_transforms(processed_data)
             if self.has_label and "label" in processed_data1:
                 return {
                     "image": processed_data1["image"],
@@ -319,7 +339,7 @@ class OnTheFly2DDataset(Dataset):
                     "label": torch.tensor([]),
                 }
         else: 
-            processed_data1 = self.weak_transforms(clean_dict)
+            processed_data1 = self.weak_transforms(self.base_transforms(clean_dict))
             if self.has_label and "label" in processed_data1:
                 return {
                     "image": processed_data1["image"],
@@ -404,7 +424,6 @@ class Flare3DPatchDataset(Dataset):
                 SafeNormalizeIntensityd(keys="image", nonzero=True, channel_wise=True),
             ]
             return Compose(initial_transforms + val_transforms)
-            # return Compose(initial_transforms)
 
 
     def __len__(self):
@@ -448,13 +467,29 @@ class Flare3DPatchDataset(Dataset):
 # Example usage:
 if __name__ == "__main__":
 #     # Assuming hf_dataset is already defined and loaded
-    patch_size = (224, 192)  # Example patch size
-    hf_dataset = load_dataset("./local_flare_loader.py", name="validation_mri", data_dir="/scratch/work/zhul2/data/FLARE-MedFM/FLARE-Task3-DomainAdaption", trust_remote_code=True)["train"]
-    dataset = OnTheFly2DDataset(hf_dataset, patch_size=patch_size, is_train=False, is_contrastive=False, has_label=True)
+    patch_size = (480, 480)  # Example patch size
+    hf_dataset = load_dataset("./local_flare_loader.py", name="train_mri_unlabeled", data_dir="/scratch/work/zhul2/data/FLARE-MedFM/FLARE-Task3-DomainAdaption", trust_remote_code=True)["train"]
+    dataset = OnTheFly2DDataset(hf_dataset, patch_size=patch_size, is_train=True, is_contrastive=True, has_label=True)
     print(f"Dataset length: {len(dataset)}")
     for i in range(len(dataset)):
         samples = dataset[i]
         print(samples["image"].shape, samples["label"].shape)
+        print(torch.unique(samples["image"]))
+        # visualize the first sample and label
+        if i == 0:
+            import matplotlib.pyplot as plt
+            plt.figure(figsize=(10, 5))
+            plt.subplot(1, 2, 1)
+            plt.imshow(samples["image"].squeeze().numpy(), cmap='gray')
+            plt.title("Image")
+            plt.axis('off')
+            plt.subplot(1, 2, 2)
+            if samples["label"].numel() > 0:
+                plt.imshow(samples["label"].squeeze().numpy(), cmap='jet', alpha=0.5)
+                plt.title("Label")
+                plt.axis('off')
+            plt.show()
+            plt.savefig("sample_image_label.png")
         break
         # if len(torch.unique(sample['label'])) > 14:
         #     print(f"Sample {i} has more than 14 classes in label: {torch.unique(sample['label'])}")

@@ -42,11 +42,55 @@ import random
 from typing import Dict, Union, List, Any
 from datasets import load_dataset
 import numpy as np
+import os
+import json
+import atexit
+import threading
 # --- STEP 1: Create a simple, self-contained custom transform ---
 
 NUM_CLASSES = 14  # Number of classes in the FLARE-3D dataset
 
 # In dataset.py, near the top
+from monai.transforms import MapTransform, Resized
+
+class ConditionalResizeSmaller(MapTransform):
+    """
+    A MapTransform that applies Resized to the specified keys only if the
+    image's spatial size is smaller than the target spatial_size in any dimension.
+    """
+    def __init__(self, keys: list, spatial_size: tuple, allow_missing_keys: bool = False):
+        """
+        Args:
+            keys: Keys to apply the resizing to.
+            spatial_size: The target spatial size for resizing.
+            allow_missing_keys: Corresponds to the parameter in super class.
+        """
+        super().__init__(keys, allow_missing_keys)
+        self.spatial_size = spatial_size
+        # Create a single instance of the Resized transform to reuse
+        self.resizer = Resized(keys=keys, spatial_size=spatial_size, allow_missing_keys=allow_missing_keys)
+
+    def __call__(self, data: dict) -> dict:
+        d = dict(data)
+        # We need to make a decision based on the image's shape.
+        # Assuming the first key is the image or a reference with the same shape.
+        ref_key = self.keys[0] 
+        
+        if ref_key not in d:
+            return d # Do nothing if the reference key is missing
+
+        img_shape = d[ref_key].shape[1:] # Get (H, W) from (C, H, W)
+        
+        # Check if any dimension is smaller than the target size
+        is_smaller = any(img_dim < target_dim for img_dim, target_dim in zip(img_shape, self.spatial_size))
+
+        if is_smaller:
+            # If it's smaller, apply the pre-configured resizer transform to the whole dictionary
+            return self.resizer(d)
+        else:
+            # Otherwise, return the data dictionary unchanged
+            return d
+        
 class SafeNormalizeIntensityd(MapTransform):
     """
     A wrapper for NormalizeIntensityd that adds a small epsilon to the
@@ -129,7 +173,10 @@ class LoadSlice(MapTransform):
     It loads the 3D volume into memory ONCE, finds all valid slice indices
     using fast, vectorized NumPy operations, and then randomly selects one.
     """
-    def __init__(self, keys: list, axis: int = 2, label_key: str = 'label'):
+    _cache = {}
+    _cache_path = None
+    _lock = threading.Lock()
+    def __init__(self, keys: list, axis: int = 2, label_key: str = 'label', cache_path: str | None = "./cache/slice_indices_cache.json"):
         """
         Args:
             keys: Keys in the data dictionary to load slices for.
@@ -142,54 +189,80 @@ class LoadSlice(MapTransform):
         self.np_axis = self.sitk_to_np_axis[axis]
         self.label_key = label_key
         self.axis = axis  # Store the original axis for reference
-
-    def _get_valid_indices(self, volume_np: np.ndarray) -> np.ndarray:
-        """Finds indices of non-blank slices using vectorized numpy."""
-        # Sum over the spatial dimensions (H, W) of the slices
+        
+        # cache
+        if cache_path:
+            LoadSlice._cache_path = os.path.abspath(cache_path)
+            with LoadSlice._lock:
+                if not LoadSlice._cache and os.path.exists(LoadSlice._cache_path):
+                    print(f"Loading slice indices from cache: {LoadSlice._cache_path}")
+                    with open(LoadSlice._cache_path, 'r') as f:
+                        LoadSlice._cache = json.load(f)
+                # Register the save function to be called on program exit
+                atexit.register(self._save_cache)
+                    
+    @classmethod
+    def _save_cache(cls):
+        """Saves the cache to a file. This is a class method."""
+        if cls._cache_path:
+            print(f"Saving slice index cache to {cls._cache_path}...")
+            # Use a temporary file and rename for atomic write
+            temp_path = cls._cache_path + ".tmp"
+            with open(temp_path, 'w') as f:
+                json.dump(cls._cache, f, indent=2)
+            os.replace(temp_path, cls._cache_path)
+            print("Cache saved.")
+            
+    def _compute_valid_indices(self, volume_np: np.ndarray) -> np.ndarray:
+        """Computes valid indices using the std method. (Your existing logic)"""
+        if volume_np.ndim != 3: return np.array([])
         sum_axes = tuple(i for i in range(volume_np.ndim) if i != self.np_axis)
-        # count unique
         slice_stds = np.std(volume_np, axis=sum_axes)
-        return np.where(slice_stds > 0.5)[0]
+        return np.where(slice_stds > 0.01)[0]
+    
 
     def __call__(self, data: Dict[str, Any]) -> Dict[str, Any]:
         d = dict(data)
-        
-        # --- Step 1: Load all required sitk volumes ---
-        sitk_volumes = {
-            key: sitk.ReadImage(d[key]) 
-            for key in self.keys if key in d and d[key] != 'N/A'
-        }
+        image_path = os.path.abspath(d["image"])
+        sitk_volumes = {key: sitk.ReadImage(d[key]) for key in self.keys if key in d and d[key] != 'N/A'}
+        np_volumes = {key: sitk.GetArrayFromImage(vol) for key, vol in sitk_volumes.items()}
+        if LoadSlice._cache_path and image_path in LoadSlice._cache:
+            valid_indices = LoadSlice._cache[image_path]
+        else:
+            try:
+                computed_indices = []
+                if self.label_key in np_volumes:
+                    computed_indices = self._compute_valid_indices(np_volumes[self.label_key])
+                
+                if len(computed_indices) == 0:
+                    computed_indices = self._compute_valid_indices(np_volumes['image'])
+                if len(computed_indices) == 0:
+                    raise ValueError(f"No valid slices found in {image_path} for label key {self.label_key}.")
 
-        # --- Step 2: Convert all volumes to NumPy arrays ONCE ---
-        # This is much more efficient than repeated conversions.
-        np_volumes = {
-            key: sitk.GetArrayFromImage(vol) for key, vol in sitk_volumes.items()
-        }
-        
-        # --- Step 3: Determine the best set of valid slice indices ---
-        valid_indices = []
-        # Prioritize finding a slice with a label
-        if self.label_key in np_volumes:
-            valid_indices = self._get_valid_indices(np_volumes[self.label_key])
-        
-        # If no labeled slices are found (or no label exists), fallback to image
-        if len(valid_indices) == 0:
-            valid_indices = self._get_valid_indices(np_volumes['image'])
-        
+                with LoadSlice._lock:
+                    LoadSlice._cache[image_path] = computed_indices
+                computed_indices_list = computed_indices.tolist()
+                if LoadSlice._cache_path:
+                    with LoadSlice._lock:
+                        LoadSlice._cache[image_path] = computed_indices_list
+                valid_indices = computed_indices_list
+            except Exception as e:
+                print(f"Warning: Could not compute indices for {image_path}: {e}")
+                valid_indices = []
+  
+        # if stik_volumes and np_volumes exists
         # --- Step 4: Choose a slice index ---
         if len(valid_indices) > 0:
             slice_idx = random.choice(valid_indices)
         else:
             # Fallback: if entire volume is blank, get depth from original sitk object
             # Using 'image' as the reference for size.
-            depth = sitk_volumes['image'].GetSize()[self.axis]
-            slice_idx = random.randint(0, depth - 1)
+            raise ValueError(f"No valid slices found in {image_path}. The volume may be empty or all slices have zero variance.")
             
         # --- Step 5: Extract the chosen slice from each NumPy volume ---
         for key, volume_np in np_volumes.items():
             # Use np.take to select the slice along the correct axis
             d[key] = np.take(volume_np, slice_idx, axis=self.np_axis)
-                
         return d
 
 
@@ -249,7 +322,7 @@ class OnTheFly2DDataset(Dataset):
                 RandRotate90d(keys=["image", "label"], prob=0.5, max_k=3, spatial_axes=(0, 1), allow_missing_keys=True),
             ])
         else: # For validation, just resize.
-            xforms.append(ResizeWithPadOrCropd(keys=["image", "label"], spatial_size=self.patch_size, allow_missing_keys=True))
+            xforms.append(Resized(keys=["image", "label"], spatial_size=self.patch_size, allow_missing_keys=True))
         xforms.append(SafeNormalizeIntensityd(keys="image", nonzero=True, channel_wise=True))
         return Compose(xforms)
 
@@ -271,14 +344,18 @@ class OnTheFly2DDataset(Dataset):
         prob_intensity_appearance = 0.5
         prob_shape = 0.5
         prob_noise = 0.2
+        prob_drop = 0.2
         # xforms.extend([Resized(spatial_size=(int(self.patch_size[0]*1.25), int(self.patch_size[0]*1.25)), keys=["image", "label"], allow_missing_keys=True)])
-        # if self.has_label:
-        #     xforms.extend([RandCropByPosNegLabeld(keys=["image", "label"], spatial_size=self.patch_size, label_key="label", allow_missing_keys=True)])
-        # else:
-        #     xforms.extend([CropForegroundd(keys=["image", "label"], source_key="image", roi_size=self.patch_size, allow_missing_keys=True)])
+        xforms.extend([ConditionalResizeSmaller(keys=["image", "label"], spatial_size=self.patch_size, allow_missing_keys=True)])
+        if self.has_label:
+            xforms.extend([RandCropByPosNegLabeld(keys=["image", "label"], spatial_size=self.patch_size, label_key="label", allow_missing_keys=True)])
+        else:
+            # xforms.extend([CropForegroundd(keys="image", source_key="image", roi_size=self.patch_size, allow_missing_keys=True)])
+            xforms.extend([RandSpatialCropd(keys=["image", "label"], roi_size=self.patch_size, random_size=False, allow_missing_keys=True)])
+
         
         xforms.extend([
-            ResizeWithPadOrCropd(keys=["image", "label"], spatial_size=self.patch_size, allow_missing_keys=True),
+            # ResizeWithPadOrCropd(keys=["image", "label"], spatial_size=self.patch_size, allow_missing_keys=True),
             # CropForegroundd(keys=["image", "label"], source_key="label", allow_missing_keys=True),
 
             RandFlipd(keys=["image", "label"], prob=prob_shape, spatial_axis=1, allow_missing_keys=True), # Horizontal flip
@@ -302,14 +379,14 @@ class OnTheFly2DDataset(Dataset):
             
              # --- Noise and Dropout ---
             RandGaussianNoised(keys="image", std=0.1, prob=prob_noise),
-            # RandCoarseDropoutd(
-            #     keys=["image", "label"],
-            #     holes=1, max_holes=3,
-            #     spatial_size=(8, 8), max_spatial_size=(16, 16),
-            #     fill_value=0, # Use 0 for background
-            #     prob=0.5,
-            #     allow_missing_keys=True
-            # ), 
+            RandCoarseDropoutd(
+                keys=["image", "label"],
+                holes=1, max_holes=3,
+                spatial_size=(8, 8), max_spatial_size=(16, 16),
+                fill_value=0, # Use 0 for background
+                prob=prob_drop,
+                allow_missing_keys=True
+            ), 
 
             # Lambdad(keys="image", func=apply_albumentations), # might be a bug here.
             # ResizeWithPadOrCropd(keys=["image", "label"], spatial_size=self.patch_size, allow_missing_keys=True),
@@ -339,11 +416,11 @@ class OnTheFly2DDataset(Dataset):
             # Apply the strong transforms to generate two augmented views
             processed_data1 = self.strong_transforms(processed_data)
             processed_data2 = self.strong_transforms(processed_data)
-            if self.has_label and "label" in processed_data1:
+            if self.has_label and "label" in processed_data1[0]:
                 return {
-                    "image": processed_data1["image"],
-                    "image2": processed_data2["image"],
-                    "label": processed_data1["label"],
+                    "image": processed_data1[0]["image"],
+                    "image2": processed_data2[0]["image"],
+                    "label": processed_data1[0]["label"],
                 }
             else:
                 return {
@@ -353,10 +430,10 @@ class OnTheFly2DDataset(Dataset):
                 }
         else: 
             processed_data1 = self.weak_transforms(self.base_transforms(clean_dict))
-            if self.has_label and "label" in processed_data1:
+            if self.has_label and "label" in processed_data1[0]:
                 return {
-                    "image": processed_data1["image"],
-                    "label": processed_data1["label"],
+                    "image": processed_data1[0]["image"],
+                    "label": processed_data1[0]["label"],
                 }
             else:
                 return {
@@ -488,7 +565,6 @@ if __name__ == "__main__":
         samples = dataset[i]
         print(samples["image"].shape, samples["label"].shape)
         print(torch.unique(samples["image"]))
-        print(samples["image"])
         # visualize the first sample and label
         if i == 0:
             import matplotlib.pyplot as plt

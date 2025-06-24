@@ -199,7 +199,8 @@ class Projector_Conv(nn.Module):
     
 class Unet_SegCLR(nn.Module):
     """A U-Net model with a SimCLR projection head on the encoder's bottleneck."""
-    def __init__(self, in_channels: int, out_channels: int, proj_output_dim: int = 128, norm: str = 'instance', deep_supervision: bool = False):
+    def __init__(self, in_channels: int, out_channels: int, proj_output_dim: int = 128, norm: str = 'instance', deep_supervision: bool = False,
+                 proj_hidden_dim: int = 30*30):
         super().__init__()
         # <<< --- PASS DEEP SUPERVISION FLAG TO UNET ---
         self.unet = UNet(in_channels, out_channels, norm=norm, deep_supervision=deep_supervision)
@@ -207,11 +208,11 @@ class Unet_SegCLR(nn.Module):
         bottleneck_channels = 1024
         self.projector = Projector_Conv(
             in_channels=bottleneck_channels,
-            proj_hidden_dim=30*30,
+            proj_hidden_dim=proj_hidden_dim,
             proj_output_dim=proj_output_dim
         )
 
-    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, Union[torch.Tensor, List[torch.Tensor]]]:
+    def forward(self, x: torch.Tensor, has_label=True) -> Tuple[torch.Tensor, Union[torch.Tensor, List[torch.Tensor]]]:
         # --- Encoder Path ---
         x1 = self.unet.in_conv(x)
         x2 = self.unet.down1(x1)
@@ -220,28 +221,34 @@ class Unet_SegCLR(nn.Module):
         bottleneck = self.unet.down4(x4)
         
         # --- Projection Head ---
-        z = self.projector(bottleneck)
-        
-        # --- Decoder Path ---
-        d1 = self.unet.up1(bottleneck, x4)
-        d2 = self.unet.up2(d1, x3)
-        d3 = self.unet.up3(d2, x2)
-        d4 = self.unet.up4(d3, x1)
-        
-        logits_final = self.unet.out_conv(d4)
-        
-        # <<< --- HANDLE MULTIPLE OUTPUTS FROM THE UNET ---
-        if self.unet.deep_supervision:
-            logits_ds1 = self.unet.ds_out1(d1)
-            logits_ds2 = self.unet.ds_out2(d2)
-            logits_ds3 = self.unet.ds_out3(d3)
-            # When using SegCLR, we only care about the final segmentation for supervised loss,
-            # but the UNet itself returns all heads. We'll return them all.
-            # Your training loop will then need to handle this list.
-            all_logits = [logits_ds1, logits_ds2, logits_ds3, logits_final]
-            return z, all_logits
+        if self.training:
+            z = self.projector(bottleneck)
         else:
-            return z, logits_final
+            z = None
+        if has_label:
+            # --- Decoder Path ---
+            d1 = self.unet.up1(bottleneck, x4)
+            d2 = self.unet.up2(d1, x3)
+            d3 = self.unet.up3(d2, x2)
+            d4 = self.unet.up4(d3, x1)
+            
+            logits_final = self.unet.out_conv(d4)
+            
+            # <<< --- HANDLE MULTIPLE OUTPUTS FROM THE UNET ---
+            if self.unet.deep_supervision:
+                logits_ds1 = self.unet.ds_out1(d1)
+                logits_ds2 = self.unet.ds_out2(d2)
+                logits_ds3 = self.unet.ds_out3(d3)
+                # When using SegCLR, we only care about the final segmentation for supervised loss,
+                # but the UNet itself returns all heads. We'll return them all.
+                # Your training loop will then need to handle this list.
+                all_logits = [logits_ds1, logits_ds2, logits_ds3, logits_final]
+                return z, all_logits
+            else:
+                return z, logits_final
+        else:
+            # If no labels, we only return the projection vector
+            return z, None
 
 
 # --- 4. Testing the Robustness and Flexibility ---
@@ -267,7 +274,7 @@ if __name__ == "__main__":
 
     print("\n--- Testing Unet_SegCLR with Deep Supervision ---")
     ds_segclr_net = Unet_SegCLR(in_channels=1, out_channels=14, deep_supervision=True).to(device)
-    z, logits_list = ds_segclr_net(standard_input)
+    z, logits_list = ds_segclr_net(standard_input, has_label=False)
     # assert isinstance(logits_list, list) and len(logits_list) == 4
     print(f"Projection Vector (z) shape: {z.shape}") # Should be (2, 128)
     print(f"Segmentation Logits is a list of {len(logits_list)} tensors.")

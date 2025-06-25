@@ -31,7 +31,7 @@ from monai.transforms import (
     RandCoarseDropoutd,
     CropForegroundd,
     RandCropByPosNegLabeld,
-    Resized
+    Resized,
 )
 
 from monai.data import NibabelReader
@@ -173,10 +173,7 @@ class LoadSlice(MapTransform):
     It loads the 3D volume into memory ONCE, finds all valid slice indices
     using fast, vectorized NumPy operations, and then randomly selects one.
     """
-    _cache = {}
-    _cache_path = None
-    _lock = threading.Lock()
-    def __init__(self, keys: list, axis: int = 2, label_key: str = 'label', cache_path: str | None = "./cache/slice_indices_cache.json"):
+    def __init__(self, keys: list, axis: int = 2, label_key: str = 'label'):
         """
         Args:
             keys: Keys in the data dictionary to load slices for.
@@ -190,33 +187,12 @@ class LoadSlice(MapTransform):
         self.label_key = label_key
         self.axis = axis  # Store the original axis for reference
         
-        # cache
-        if cache_path:
-            LoadSlice._cache_path = os.path.abspath(cache_path)
-            with LoadSlice._lock:
-                if not LoadSlice._cache and os.path.exists(LoadSlice._cache_path):
-                    print(f"Loading slice indices from cache: {LoadSlice._cache_path}")
-                    with open(LoadSlice._cache_path, 'r') as f:
-                        LoadSlice._cache = json.load(f)
-                # Register the save function to be called on program exit
-                atexit.register(self._save_cache)
-                    
-    @classmethod
-    def _save_cache(cls):
-        """Saves the cache to a file. This is a class method."""
-        if cls._cache_path:
-            print(f"Saving slice index cache to {cls._cache_path}...")
-            # Use a temporary file and rename for atomic write
-            temp_path = cls._cache_path + ".tmp"
-            with open(temp_path, 'w') as f:
-                json.dump(cls._cache, f, indent=2)
-            os.replace(temp_path, cls._cache_path)
-            print("Cache saved.")
             
     def _compute_valid_indices(self, volume_np: np.ndarray) -> np.ndarray:
         """Computes valid indices using the std method. (Your existing logic)"""
         if volume_np.ndim != 3: return np.array([])
         sum_axes = tuple(i for i in range(volume_np.ndim) if i != self.np_axis)
+        # get number of unique values in the slice
         slice_stds = np.std(volume_np, axis=sum_axes)
         return np.where(slice_stds > 0.01)[0]
     
@@ -226,30 +202,15 @@ class LoadSlice(MapTransform):
         image_path = os.path.abspath(d["image"])
         sitk_volumes = {key: sitk.ReadImage(d[key]) for key in self.keys if key in d and d[key] != 'N/A'}
         np_volumes = {key: sitk.GetArrayFromImage(vol) for key, vol in sitk_volumes.items()}
-        if LoadSlice._cache_path and image_path in LoadSlice._cache:
-            valid_indices = LoadSlice._cache[image_path]
-        else:
-            try:
-                computed_indices = []
-                if self.label_key in np_volumes:
-                    computed_indices = self._compute_valid_indices(np_volumes[self.label_key])
-                
-                if len(computed_indices) == 0:
-                    computed_indices = self._compute_valid_indices(np_volumes['image'])
-                if len(computed_indices) == 0:
-                    raise ValueError(f"No valid slices found in {image_path} for label key {self.label_key}.")
+        valid_indices = []
+        # if self.label_key in np_volumes:
+        #     computed_indices = self._compute_valid_indices(np_volumes[self.label_key])
 
-                with LoadSlice._lock:
-                    LoadSlice._cache[image_path] = computed_indices
-                computed_indices_list = computed_indices.tolist()
-                if LoadSlice._cache_path:
-                    with LoadSlice._lock:
-                        LoadSlice._cache[image_path] = computed_indices_list
-                valid_indices = computed_indices_list
-            except Exception as e:
-                print(f"Warning: Could not compute indices for {image_path}: {e}")
-                valid_indices = []
-  
+        if len(valid_indices) == 0:
+            valid_indices = self._compute_valid_indices(np_volumes['image'])
+        if len(valid_indices) == 0:
+            raise ValueError(f"No valid slices found in {image_path} for label key {self.label_key}.")
+        
         # if stik_volumes and np_volumes exists
         # --- Step 4: Choose a slice index ---
         if len(valid_indices) > 0:
@@ -309,6 +270,7 @@ class OnTheFly2DDataset(Dataset):
             allow_missing_keys=True
                 ),
             ClipIntensityPercentiled(keys="image", lower_percentile=0.5, upper_percentile=99.5),
+            Resized(keys=["image", "label"], spatial_size=(512, 512), allow_missing_keys=True),
         ])
 
     def _get_weak_transforms(self):
@@ -317,41 +279,23 @@ class OnTheFly2DDataset(Dataset):
 
         if self.is_train:
             xforms.extend([
-                ResizeWithPadOrCropd(keys=["image", "label"], spatial_size=self.patch_size, allow_missing_keys=True),
+                RandSpatialCropd(keys=["image", "label"], roi_size=self.patch_size, allow_missing_keys=True),
                 RandFlipd(keys=["image", "label"], prob=0.5, spatial_axis=1, allow_missing_keys=True), # Horizontal flip
                 RandRotate90d(keys=["image", "label"], prob=0.5, max_k=3, spatial_axes=(0, 1), allow_missing_keys=True),
             ])
-        else: # For validation, just resize.
-            xforms.append(Resized(keys=["image", "label"], spatial_size=self.patch_size, allow_missing_keys=True))
         xforms.append(SafeNormalizeIntensityd(keys="image", nonzero=True, channel_wise=True))
         return Compose(xforms)
 
     def _get_strong_transforms(self):
         """Strong augmentations for the second contrastive view (x')."""
         
-        albumentations_xforms = A.Compose([
-            A.ToRGB(p=1.0),
-            A.ColorJitter(brightness=0.6, contrast=0.2, p=0.8),
-            A.ToGray(p=1.0, num_output_channels=1),
-        ])
-
-        def apply_albumentations(img_numpy):
-            img_numpy = img_numpy.squeeze(0).numpy()  # Remove channel dimension if present
-            augmented = albumentations_xforms(image=img_numpy)['image']
-            return torch.from_numpy(augmented).unsqueeze(0)  # Add channel dimension back
-
         xforms = []
-        prob_intensity_appearance = 0.5
-        prob_shape = 0.5
+        prob_intensity_appearance = 0.2
+        prob_shape = 0.8
         prob_noise = 0.2
         prob_drop = 0.2
-        # xforms.extend([Resized(spatial_size=(int(self.patch_size[0]*1.25), int(self.patch_size[0]*1.25)), keys=["image", "label"], allow_missing_keys=True)])
-        xforms.extend([ConditionalResizeSmaller(keys=["image", "label"], spatial_size=self.patch_size, allow_missing_keys=True)])
-        if self.has_label:
-            xforms.extend([RandCropByPosNegLabeld(keys=["image", "label"], spatial_size=self.patch_size, label_key="label", allow_missing_keys=True)])
-        else:
-            # xforms.extend([CropForegroundd(keys="image", source_key="image", roi_size=self.patch_size, allow_missing_keys=True)])
-            xforms.extend([RandSpatialCropd(keys=["image", "label"], roi_size=self.patch_size, random_size=False, allow_missing_keys=True)])
+
+        xforms.extend([RandSpatialCropd(keys=["image", "label"], roi_size=self.patch_size, random_size=False, allow_missing_keys=True)])
 
         
         xforms.extend([
@@ -359,7 +303,7 @@ class OnTheFly2DDataset(Dataset):
             # CropForegroundd(keys=["image", "label"], source_key="label", allow_missing_keys=True),
 
             RandFlipd(keys=["image", "label"], prob=prob_shape, spatial_axis=1, allow_missing_keys=True), # Horizontal flip
-            RandRotate90d(keys=["image", "label"], prob=0.5, max_k=3, spatial_axes=(0, 1), allow_missing_keys=True),
+            RandRotate90d(keys=["image", "label"], prob=prob_shape, max_k=3, spatial_axes=(0, 1), allow_missing_keys=True),
             RandAffined(
                 keys=["image", "label"],
                 prob=prob_shape,
@@ -378,7 +322,7 @@ class OnTheFly2DDataset(Dataset):
             ]),
             
              # --- Noise and Dropout ---
-            RandGaussianNoised(keys="image", std=0.1, prob=prob_noise),
+            RandGaussianNoised(keys="image", std=0.01, prob=prob_noise),
             RandCoarseDropoutd(
                 keys=["image", "label"],
                 holes=1, max_holes=3,
@@ -388,7 +332,6 @@ class OnTheFly2DDataset(Dataset):
                 allow_missing_keys=True
             ), 
 
-            # Lambdad(keys="image", func=apply_albumentations), # might be a bug here.
             ResizeWithPadOrCropd(keys=["image", "label"], spatial_size=self.patch_size, allow_missing_keys=True), # just in case the previous transforms changed the size
             SafeNormalizeIntensityd(keys="image", nonzero=True, channel_wise=True),
         ])
@@ -416,11 +359,11 @@ class OnTheFly2DDataset(Dataset):
             # Apply the strong transforms to generate two augmented views
             processed_data1 = self.strong_transforms(processed_data)
             processed_data2 = self.strong_transforms(processed_data)
-            if self.has_label and "label" in processed_data1[0]:
+            if self.has_label and "label" in processed_data1:
                 return {
-                    "image": processed_data1[0]["image"],
-                    "image2": processed_data2[0]["image"],
-                    "label": processed_data1[0]["label"],
+                    "image": processed_data1["image"],
+                    "image2": processed_data2["image"],
+                    "label": processed_data1["label"],
                 }
             else:
                 return {
@@ -443,6 +386,102 @@ class OnTheFly2DDataset(Dataset):
 
 
 
+class Flare2DDataset(Dataset):
+    """
+    A 2D Dataset for the FLARE challenge using preprocessed 2D slices saved as .npy files.
+    This dataset is designed for training and validation, with optional contrastive learning support.
+    """
+    def __init__(self, data_path, patch_size=(224, 192), is_train=True, is_contrastive=False, has_label=True):
+        """
+        Args:
+            data_path (str): Path to the directory containing the preprocessed .npy files, with subdirectories ./images and ./masks.
+            with same name as the image files.
+            patch_size (tuple): Size of the patches to be extracted from the images.
+            is_train (bool): Whether this dataset is for training or validation.
+            is_contrastive (bool): Whether to generate two augmented views for contrastive learning.
+            has_label (bool): Whether the dataset contains labels.
+        """
+        self.is_train = is_train
+        self.patch_size = patch_size
+        self.is_contrastive = is_contrastive
+        self.has_label = has_label
+        self.data_dicts = []
+        # Load all image paths from the specified directory
+        image_dir = os.path.join(data_path, "images")
+        mask_dir = os.path.join(data_path, "masks") if has_label else None
+        if not os.path.exists(image_dir):
+            raise ValueError(f"Image directory {image_dir} does not exist.")
+        image_files = sorted(os.listdir(image_dir))
+        for image_file in image_files:
+            if image_file.endswith(".npy"):
+                image_path = os.path.join(image_dir, image_file)
+                label_path = None
+                if has_label:
+                    label_path = os.path.join(mask_dir, image_file) if mask_dir else None
+                self.data_dicts.append({
+                    "image": image_path,
+                    "label": label_path
+                })
+        
+        self.base_transforms = self._get_base_transforms()
+        
+    def _get_base_transforms(self):
+        """Common transforms for both pipelines (loading and initial formatting)."""
+        return Compose([
+            EnsureChannelFirstd(keys=["image", "label"], channel_dim="no_channel", allow_missing_keys=True),
+            EnsureTyped(keys="image", dtype=torch.float32),
+            EnsureTyped(keys="label", dtype=torch.int8, allow_missing_keys=True),
+            Lambdad(
+                keys="label", 
+                func=lambda x: torch.clamp(x, min=0, max=NUM_CLASSES - 1),
+                allow_missing_keys=True
+            ),
+            ClipIntensityPercentiled(keys="image", lower_percentile=0.5, upper_percentile=99.5),
+            Resized(keys=["image", "label"], spatial_size=(512, 512), allow_missing_keys=True),
+        ])
+    
+    def _get_weak_transforms(self):
+        """Standard augmentations for training (view x) or validation."""
+        xforms = []
+
+        if self.is_train:
+            xforms.extend([
+                RandSpatialCropd(keys=["image", "label"], spatial_size=self.patch_size, allow_missing_keys=True),
+                RandFlipd(keys=["image", "label"], prob=0.5, spatial_axis=1, allow_missing_keys=True), # Horizontal flip
+                RandRotate90d(keys=["image", "label"], prob=0.5, max_k=3, spatial_axes=(0, 1), allow_missing_keys=True),
+            ])
+        xforms.append(SafeNormalizeIntensityd(keys="image", nonzero=True, channel_wise=True))
+        return Compose(xforms)
+    
+    def __len__(self):
+        return len(self.data_dicts)
+    
+    def __getitem__(self, idx):
+        # first read the image and label from the file paths
+        item_dict = self.data_dicts[idx].copy()
+        image_path = item_dict["image"]
+        label_path = item_dict.get("label", "N/A")
+        if not os.path.exists(image_path):
+            raise FileNotFoundError(f"Image file {image_path} does not exist.")
+        # Load the image and label as numpy arrays
+        image_np = np.load(image_path)
+        if label_path != "N/A" and os.path.exists(label_path):
+            label_np = np.load(label_path)
+        else:
+            label_np = np.array([])  # Empty array if no label is provided
+        # Create a dictionary to hold the data
+        data_dict = {"image": image_np, "label": label_np}
+        # Apply the base transforms
+        processed_data = self.base_transforms(data_dict)
+        # Apply the weak transforms for training or validation
+        processed_data_weak = self._get_weak_transforms()(processed_data)
+        return {
+            "image": processed_data_weak["image"],
+            "label": processed_data_weak.get("label", torch.tensor([]))}
+        
+        
+            
+            
 class Flare3DPatchDataset(Dataset):
     """
     Robust 3D Dataset for the FLARE challenge using 3D patch sampling.
@@ -558,15 +597,18 @@ class Flare3DPatchDataset(Dataset):
 if __name__ == "__main__":
 #     # Assuming hf_dataset is already defined and loaded
     patch_size = (1000, 1000)  # Example patch size
-    hf_dataset = load_dataset("./local_flare_loader.py", name="train_ct_pseudo", data_dir="/scratch/work/zhul2/data/FLARE-MedFM/FLARE-Task3-DomainAdaption", trust_remote_code=True)["train"]
-    dataset = OnTheFly2DDataset(hf_dataset, patch_size=patch_size, is_train=False, is_contrastive=False, has_label=True)
-
+    # hf_dataset = load_dataset("./local_flare_loader.py", name="train_mri_unlabeled", data_dir="/scratch/work/zhul2/data/FLARE-MedFM/FLARE-Task3-DomainAdaption", trust_remote_code=True)["train"]
+    # dataset = OnTheFly2DDataset(hf_dataset, patch_size=patch_size, is_train=True, is_contrastive=True, has_label=True)
+    dataset = Flare2DDataset(
+        data_path="/scratch/work/zhul2/data/FLARE-MedFM/processed_2d_flare/train_ct_gt",
+        patch_size=patch_size, is_train=True, is_contrastive=True, has_label=True
+    )
     for i in range(len(dataset)):
         samples = dataset[i]
         print(samples["image"].shape, samples["label"].shape)
         print(torch.unique(samples["image"]).shape)
         # visualize the first sample and label
-        if i == 0:
+        if i < 3:
             import matplotlib.pyplot as plt
             plt.figure(figsize=(10, 5))
             plt.subplot(1, 2, 1)
@@ -579,15 +621,7 @@ if __name__ == "__main__":
                 plt.title("Label")
                 plt.axis('off')
             plt.show()
-            plt.savefig("sample_image_label.png")
-        
-        # if len(torch.unique(sample['label'])) > 14:
-        #     print(f"Sample {i} has more than 14 classes in label: {torch.unique(sample['label'])}")
-        # Print the shapes of the image and label tensors
-        # if 'label' in sample:
-        #     print(f"Sample {i} - Image shape: {sample['image'].shape}, Label shape: {sample['label'].shape}, Label unique values: {torch.unique(sample['label']).size()}")
-        # else:
-        #     print(f"Sample {i} - Image shape: {sample['image'].shape}, No label available")
-        # Uncomment to see the actual data
-        # print(sample)
+            plt.savefig(f"sample_image_label_{i}.png")
+        else:
+            break
 

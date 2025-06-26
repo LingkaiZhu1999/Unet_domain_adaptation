@@ -21,7 +21,8 @@ import wandb
 from datasets import load_dataset, concatenate_datasets
 from loss import MultiClassDiceCELoss, NTXentLoss
 from metrics import AverageMeter
-from unet import Unet_SegCLR # The model that outputs features and logits
+from unet import Unet_SegCLR
+# from unet_monai import UNet_SegCLR  # Assuming you have a MONAI-compatible Unet model
 from utils import save_validation_results
 
 # --- 1. Argument Parsing (Combined from both scripts) ---
@@ -43,6 +44,12 @@ def parse_args():
     parser.add_argument('-b', '--batch_size', default=8, type=int)
     parser.add_argument('--lr', default=1e-4, type=float, help='Initial learning rate for AdamW')
     parser.add_argument('--validate_every', default=2, type=int)
+    parser.add_argument('--patch_size', default=(512, 512), type=int, nargs=2, help='Patch size for training and validation')
+    default_weights = 70 / torch.tensor([1201., 135., 189., 74., 70., 43., 2., 3., 26., 8., 176., 41., 139.])
+    default_weights = torch.concat((torch.tensor([0.01]), default_weights))  #
+    default_weights = torch.clamp(default_weights, max=10.0, min=0.1)  # Clamp weights to avoid too high or too low values
+    parser.add_argument("--class_weights", default=default_weights, type=float, nargs='+',
+                        help="Weights for each class in the loss function. Default is based on FLARE2024 Task 3 class distribution.")
 
     # --- SegCLR Specific Hyperparameters ---
     parser.add_argument('--lam', default=1.0, type=float, help='Weight for the supervised loss')
@@ -53,16 +60,19 @@ def parse_args():
     parser.add_argument('--device', default='cuda:0')
     parser.add_argument('--num_workers', default=64, type=int)
     parser.add_argument('--seed', type=int, default=42)
+    parser.add_argument('--experiment_id', type=int, default=1, help='Experiment ID for logging')
+
     
     args = parser.parse_args()
     if not args.name:
-        args.name = f"SegCLR_{args.source_domain1}_{args.source_domain2}_to_{args.target_domain}_lam{args.lam}_mode_{args.contrastive_mode}_lr{args.lr}_epochs{args.epochs}_{args.seed}"
+        args.name = f"SegCLR_{args.source_domain1}_{args.source_domain2}_to_{args.target_domain}_lam{args.lam}_{args.contrastive_mode}_lr{args.lr}_{args.patch_size}_{args.seed}_exp{args.experiment_id}"
     return args
 
 # --- 2. Training and Validation Functions (Adapted for SegCLR) ---
 
-def train_epoch_segclr(model, source_loader, target_iterator, optimizer, sup_criterion, con_criterion, scaler, device, args):
+def train_epoch_segclr(model, source_loader, target_iterator, optimizer, sup_criterion, con_criterion, dice_metric, post_trans, scaler, device, args, save_path=""):
     model.train()
+    dice_metric.reset()
     sup_loss_meter = AverageMeter()
     con_loss_meter = AverageMeter()
 
@@ -113,13 +123,22 @@ def train_epoch_segclr(model, source_loader, target_iterator, optimizer, sup_cri
             total_loss = args.lam * supervise_loss + contrast_loss
         
         scaler.scale(total_loss).backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         scaler.step(optimizer)
         scaler.update()
         
-        sup_loss_meter.update(supervise_loss.item(), s_img1.size(0))
-        con_loss_meter.update(contrast_loss.item(), t_img1.size(0))
-        
-    return OrderedDict([('sup_loss', sup_loss_meter.avg), ('con_loss', con_loss_meter.avg)])
+        sup_loss_meter.update(supervise_loss.item())
+        con_loss_meter.update(contrast_loss.item())
+        processed_outputs = [post_trans(output_item) for output_item in decollate_batch(logits_s1)]
+        dice_metric(y_pred=processed_outputs, y=decollate_batch(s_label))
+    
+    
+    save_validation_results(
+        s_img1, s_label, torch.stack(processed_outputs), 0,
+        output_dir=save_path
+    )
+
+    return OrderedDict([('sup_loss', sup_loss_meter.avg), ('con_loss', con_loss_meter.avg), ('dice', dice_metric.aggregate().mean().item())])
 
 def validate_epoch(model, loader, criterion, dice_metric, device, post_trans, epoch=0, save_path=""):
     model.eval()
@@ -132,9 +151,9 @@ def validate_epoch(model, loader, criterion, dice_metric, device, post_trans, ep
             labels = batch['label'].to(device, non_blocking=True)
 
             with autocast(device_type=device.type, dtype=torch.float16):
-                _, outputs = model(images) # We only need the segmentation logits for validation
+                _, outputs = model(images, has_label=True) 
                 loss = criterion(outputs, labels)
-            loss_meter.update(loss.item(), images.size(0))
+            loss_meter.update(loss.item())
 
             processed_outputs = [post_trans(output_item) for output_item in decollate_batch(outputs)]
             dice_metric(y_pred=processed_outputs, y=decollate_batch(labels))
@@ -157,6 +176,9 @@ def main():
     model_dir.mkdir(parents=True, exist_ok=True)
     save_path = model_dir / 'validation_results'
     save_path.mkdir(parents=True, exist_ok=True)
+    # weight = 70. / torch.tensor([1201., 135., 189., 74., 70., 43., 2., 3., 26., 8., 176., 41., 139.])
+    # weight = torch.concat((torch.tensor([0.05]), weight))  # Add a small weight for the background class
+    # args.weight = weight.to(args.device)
     wandb.init(
         project="SegCLR_Domain_Adaptation",
         name=args.name,
@@ -170,8 +192,6 @@ def main():
     if True:
         print("Using 2D model.")
         from dataset import OnTheFly2DDataset as FlarePatchDataset
-        PATCH_SIZE_TRAIN = (512, 512)
-        PATCH_SIZE_VAL = (480, 480)  
 
     # --- Setup Directories and Seeds ---
 
@@ -191,11 +211,11 @@ def main():
     hf_val = load_dataset("./local_flare_loader.py", name=args.val_domain, data_dir=str(args.data_dir), trust_remote_code=True)["train"]
 
     # Datasets for contrastive training
-    source_dataset = FlarePatchDataset(hf_source, patch_size=PATCH_SIZE_TRAIN, is_train=True, is_contrastive=True, has_label=True)
-    target_dataset = FlarePatchDataset(hf_target, patch_size=PATCH_SIZE_TRAIN, is_train=True, is_contrastive=True, has_label=False)
+    source_dataset = FlarePatchDataset(hf_source, patch_size=args.patch_size, is_train=True, is_contrastive=True, has_label=True)
+    target_dataset = FlarePatchDataset(hf_target, patch_size=args.patch_size, is_train=True, is_contrastive=True, has_label=False)
 
     # Dataset for standard validation
-    val_dataset = FlarePatchDataset(hf_val, patch_size=PATCH_SIZE_VAL, is_train=False, is_contrastive=False, has_label=True)
+    val_dataset = FlarePatchDataset(hf_val, patch_size=args.patch_size, is_train=False, is_contrastive=False, has_label=True)
 
     source_cached_dataset = CacheDataset(data=source_dataset, cache_rate=1., num_workers=args.num_workers)
     target_cached_dataset = CacheDataset(data=target_dataset, cache_rate=1., num_workers=args.num_workers)
@@ -208,16 +228,18 @@ def main():
     target_iterator = cycle(target_loader)
     
     # --- Model, Losses, Optimizer ---
-    model = Unet_SegCLR(in_channels=1, out_channels=args.output_channel).to(device)
+    model = Unet_SegCLR(in_channels=1, out_channels=args.output_channel, proj_hidden_dim=1024).to(device)
     # limit of compile to be 64
     torch._dynamo.config.cache_size_limit = 64
     model = torch.compile(model, mode="max-autotune")
-    
-    sup_criterion = MultiClassDiceCELoss(num_classes=args.output_channel).to(device)
+
+    sup_criterion = MultiClassDiceCELoss(num_classes=args.output_channel, weight=torch.tensor(args.class_weights)).to(device)
     con_criterion = NTXentLoss(device, args.batch_size, args.temperature, use_cosine_similarity=True)
     
     optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4, fused=True)
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
+    scheduler = optim.lr_scheduler.PolynomialLR(optimizer, total_iters=args.epochs, power=0.9)  # Polynomial decay scheduler
+    # anneal faster
+    # scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=10, T_mult=2, eta_min=1e-6)
     scaler = GradScaler()
     
     # --- Validation Metrics Setup ---
@@ -229,7 +251,7 @@ def main():
     epoch_progress = tqdm(range(1, args.epochs + 1), desc="Training Progress", unit="epoch")
     for epoch in epoch_progress:
         
-        train_log = train_epoch_segclr(model, source_loader, target_iterator, optimizer, sup_criterion, con_criterion, scaler, device, args)
+        train_log = train_epoch_segclr(model, source_loader, target_iterator, optimizer, sup_criterion, con_criterion, dice_metric, post_trans, scaler, device, args, save_path)
         epoch_progress.set_postfix({
             'Epoch': epoch,
             'Sup Loss': train_log['sup_loss'],
@@ -240,6 +262,7 @@ def main():
         # Log training losses
         writer.add_scalar("Loss/Supervised", train_log['sup_loss'], epoch)
         writer.add_scalar("Loss/Contrastive", train_log['con_loss'], epoch)
+        writer.add_scalar("Dice/Training_Average", train_log['dice'], epoch)
 
         scheduler.step()
         writer.add_scalar("Meta/LR", optimizer.param_groups[0]['lr'], epoch)
@@ -255,7 +278,7 @@ def main():
             writer.add_scalar("Loss/Validation_CEDice", val_log['val_loss'], epoch)
             # val_dice_per_class
             for i, dice in enumerate(val_log['val_dice_per_class']):
-                writer.add_scalar(f"Dice/Validation_Class_{i}", dice, epoch)
+                writer.add_scalar(f"Dice/Validation_Class_{i+1}", dice, epoch)
 
             epoch_progress.set_postfix({"Validation Dice": val_log['val_dice'], 
                                         "Validation CEDiceLoss": val_log['val_loss']})

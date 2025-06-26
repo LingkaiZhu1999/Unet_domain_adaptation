@@ -14,12 +14,15 @@ class MultiClassDiceCELoss(nn.Module):
         if weight is None:
             # 0.01 for the background class, 1.0 for all other classes
             weight = torch.tensor([0.01] + [1.0] * (num_classes - 1), dtype=torch.float32)
-        else:
-            weight = torch.ones(num_classes, dtype=torch.float32)
+        #     # given info https://github.com/openmedlab/Awesome-Medical-Dataset/blob/main/resources/FLARE2024_Task3.md
+        #     # use inverse median volume to assign weights to achieve class balance
+        #     weight = 70. / torch.tensor([1201., 135., 189., 74., 70., 43., 2., 3., 26., 8., 176., 41., 139.])
+        #     weight = torch.concat((torch.tensor([0.05]), weight))  # Add a small weight for the background class
+            # weight = torch.clamp(weight, max=15.0, min=0.01)  # Clamp weights to avoid too high or too low values
         self.loss = DiceCELoss(
             to_onehot_y=True,  
             softmax=True,      # Apply softmax to model outputs (logits)
-            # include_background=False, # Crucial: Don't calculate Dice for background
+            include_background=True, # Crucial: Don't calculate Dice for background
             batch=True,        # Calculate loss over the whole batch
             weight=weight      # Apply class weights
         )

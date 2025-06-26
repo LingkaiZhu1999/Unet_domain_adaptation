@@ -32,6 +32,7 @@ from monai.transforms import (
     CropForegroundd,
     RandCropByPosNegLabeld,
     Resized,
+    RandZoomd,
 )
 
 from monai.data import NibabelReader
@@ -46,6 +47,7 @@ import os
 import json
 import atexit
 import threading
+import torch.distributions as dist
 # --- STEP 1: Create a simple, self-contained custom transform ---
 
 NUM_CLASSES = 14  # Number of classes in the FLARE-3D dataset
@@ -91,42 +93,6 @@ class ConditionalResizeSmaller(MapTransform):
             # Otherwise, return the data dictionary unchanged
             return d
         
-class SafeNormalizeIntensityd(MapTransform):
-    """
-    A wrapper for NormalizeIntensityd that adds a small epsilon to the
-    standard deviation to prevent division-by-zero errors when an image
-    patch is all zeros.
-    """
-    def __init__(self, keys: list, nonzero: bool = True, channel_wise: bool = True, subtrahend=None, divisor=None):
-        super().__init__(keys, allow_missing_keys=True)
-        self.normalizer = NormalizeIntensityd(
-            keys=keys, 
-            nonzero=nonzero, 
-            channel_wise=channel_wise,
-            subtrahend=subtrahend,
-            divisor=divisor
-        )
-        self.nonzero = nonzero
-
-    def __call__(self, data: Dict[str, Any]) -> Dict[str, Any]:
-        d = dict(data)
-        for key in self.keys:
-            if key in d:
-                img = d[key]
-                # If nonzero is True, check if there are any non-zero pixels
-                if self.nonzero and torch.count_nonzero(img) == 0:
-                    # If the image is all zeros, normalization is not needed and unsafe.
-                    # The image remains all zeros.
-                    continue
-                
-                # For non-zero images, apply the standard normalizer
-                # We can add an epsilon to the divisor calculation within the original,
-                # but a simpler safe-guard is to just check std dev.
-                pix_to_consider = img[img != 0] if self.nonzero else img.flatten()
-                if pix_to_consider.numel() > 0 and torch.std(pix_to_consider) > 1e-6:
-                    d = self.normalizer(d)
-                # else: if std is zero, do nothing, the image is constant.
-        return d
     
 class ClipIntensityPercentiled(MapTransform):
     """
@@ -173,7 +139,7 @@ class LoadSlice(MapTransform):
     It loads the 3D volume into memory ONCE, finds all valid slice indices
     using fast, vectorized NumPy operations, and then randomly selects one.
     """
-    def __init__(self, keys: list, axis: int = 2, label_key: str = 'label'):
+    def __init__(self, keys: list, axis: int = 2, label_key: str = 'label', num_classes: int = NUM_CLASSES):
         """
         Args:
             keys: Keys in the data dictionary to load slices for.
@@ -186,15 +152,46 @@ class LoadSlice(MapTransform):
         self.np_axis = self.sitk_to_np_axis[axis]
         self.label_key = label_key
         self.axis = axis  # Store the original axis for reference
-        
-            
-    def _compute_valid_indices(self, volume_np: np.ndarray) -> np.ndarray:
+        self.num_classes = num_classes
+        # normalize the categorical logits
+        self.categorical_logits = 70. / torch.tensor([1201., 135., 189., 74., 70., 43., 2., 3., 26., 8., 176., 41., 139.])
+        self.categorical_logits = torch.concat((torch.tensor([0.01]), self.categorical_logits))  # Add a small weight for the background class
+        self.categorical_logits = torch.clamp(self.categorical_logits, max=10.0, min=0.1)  # Clamp weights to avoid too high or too low values
+        self.categorical_logits = self.categorical_logits / self.categorical_logits.sum()
+
+    def _compute_valid_indices(self, volume_np: np.ndarray, is_label: bool) -> np.ndarray:
         """Computes valid indices using the std method. (Your existing logic)"""
         if volume_np.ndim != 3: return np.array([])
         sum_axes = tuple(i for i in range(volume_np.ndim) if i != self.np_axis)
         # get number of unique values in the slice
-        slice_stds = np.std(volume_np, axis=sum_axes)
-        return np.where(slice_stds > 0.01)[0]
+        if is_label and self.num_classes is not None:
+            # Generate the list of expected class values (e.g., [0, 1, ..., 13])
+            # all_class_values = [6, 8]
+            # print(all_class_values)
+            # define a probability distribution for the classes
+            categorical = dist.Categorical(probs=self.categorical_logits)
+            include_class_values = categorical.sample((1,)).tolist()
+
+            # For each class, find which slices contain it.
+            # (volume_np == c) creates a 3D boolean mask for class c.
+            # .any(axis=sum_axes) collapses the slice dimensions, resulting in a 1D
+            # boolean array indicating if class c is present in each slice.
+            slice_has_class = [
+                (volume_np == c).any(axis=sum_axes) for c in include_class_values
+            ]
+
+            # Stack the 1D arrays into a 2D array (num_classes, num_slices)
+            stacked_presences = np.stack(slice_has_class, axis=0)
+
+            # A slice is valid only if it has ALL classes.
+            # np.all(axis=0) finds slices where every class is present.
+            slice_has_all_classes = np.all(stacked_presences, axis=0)
+            # Get the indices where the condition is True
+            valid_indices = np.where(slice_has_all_classes)[0]
+            return valid_indices
+        else:
+            slice_stds = np.std(volume_np, axis=sum_axes)
+        return np.where(slice_stds > 0.001)[0]
     
 
     def __call__(self, data: Dict[str, Any]) -> Dict[str, Any]:
@@ -203,11 +200,11 @@ class LoadSlice(MapTransform):
         sitk_volumes = {key: sitk.ReadImage(d[key]) for key in self.keys if key in d and d[key] != 'N/A'}
         np_volumes = {key: sitk.GetArrayFromImage(vol) for key, vol in sitk_volumes.items()}
         valid_indices = []
-        # if self.label_key in np_volumes:
-        #     computed_indices = self._compute_valid_indices(np_volumes[self.label_key])
+        if self.label_key in np_volumes:
+            valid_indices = self._compute_valid_indices(np_volumes[self.label_key], is_label=True)
 
         if len(valid_indices) == 0:
-            valid_indices = self._compute_valid_indices(np_volumes['image'])
+            valid_indices = self._compute_valid_indices(np_volumes['image'], is_label=False)
         if len(valid_indices) == 0:
             raise ValueError(f"No valid slices found in {image_path} for label key {self.label_key}.")
         
@@ -283,19 +280,19 @@ class OnTheFly2DDataset(Dataset):
                 RandFlipd(keys=["image", "label"], prob=0.5, spatial_axis=1, allow_missing_keys=True), # Horizontal flip
                 RandRotate90d(keys=["image", "label"], prob=0.5, max_k=3, spatial_axes=(0, 1), allow_missing_keys=True),
             ])
-        xforms.append(SafeNormalizeIntensityd(keys="image", nonzero=True, channel_wise=True))
+        xforms.append(NormalizeIntensityd(keys="image", nonzero=True, channel_wise=True))
         return Compose(xforms)
 
     def _get_strong_transforms(self):
         """Strong augmentations for the second contrastive view (x')."""
         
         xforms = []
-        prob_intensity_appearance = 0.2
-        prob_shape = 0.8
+        prob_intensity_appearance = 0.8
+        prob_shape = 1.0
         prob_noise = 0.2
         prob_drop = 0.2
 
-        xforms.extend([RandSpatialCropd(keys=["image", "label"], roi_size=self.patch_size, random_size=False, allow_missing_keys=True)])
+        # xforms.extend([RandSpatialCropd(keys=["image", "label"], roi_size=self.patch_size, random_size=False, allow_missing_keys=True)])
 
         
         xforms.extend([
@@ -307,12 +304,21 @@ class OnTheFly2DDataset(Dataset):
             RandAffined(
                 keys=["image", "label"],
                 prob=prob_shape,
-                scale_range=((0, 0.15), (0, 0.15)), # Scale up to 15%
+                # scale_range=((0, 0.15), (0, 0.15)), 
                 translate_range=(self.patch_size[0] * 0.15, self.patch_size[1] * 0.15),
-                rotate_range=(np.pi / 12,), # Rotate up to 30 degrees
+                # rotate_range=(np.pi / 12,), # Rotate up to 30 degrees
                 mode=("bilinear", "nearest"),
                 padding_mode="reflection",
                 allow_missing_keys=True
+            ),
+            RandZoomd(
+                keys=["image", "label"],
+                prob=prob_shape,
+                min_zoom=1.0,
+                max_zoom=1.5,
+                mode=("bilinear", "nearest"),
+                padding_mode="reflection",
+                allow_missing_keys=True,
             ),
             # --- Intensity and Appearance Augmentations (applied in a random order) ---
             RandomOrder([
@@ -332,8 +338,7 @@ class OnTheFly2DDataset(Dataset):
                 allow_missing_keys=True
             ), 
 
-            ResizeWithPadOrCropd(keys=["image", "label"], spatial_size=self.patch_size, allow_missing_keys=True), # just in case the previous transforms changed the size
-            SafeNormalizeIntensityd(keys="image", nonzero=True, channel_wise=True),
+            NormalizeIntensityd(keys="image", nonzero=True, channel_wise=True),
         ])
         return Compose(xforms)
     
@@ -450,7 +455,7 @@ class Flare2DDataset(Dataset):
                 RandFlipd(keys=["image", "label"], prob=0.5, spatial_axis=1, allow_missing_keys=True), # Horizontal flip
                 RandRotate90d(keys=["image", "label"], prob=0.5, max_k=3, spatial_axes=(0, 1), allow_missing_keys=True),
             ])
-        xforms.append(SafeNormalizeIntensityd(keys="image", nonzero=True, channel_wise=True))
+        xforms.append(NormalizeIntensityd(keys="image", nonzero=True, channel_wise=True))
         return Compose(xforms)
     
     def __len__(self):
@@ -529,7 +534,7 @@ class Flare3DPatchDataset(Dataset):
                         RandFlipd(keys=keys, prob=0.5, spatial_axis=0),
                         RandFlipd(keys=keys, prob=0.5, spatial_axis=1),
                         RandFlipd(keys=keys, prob=0.5, spatial_axis=2),
-                        SafeNormalizeIntensityd(keys="image", nonzero=True, channel_wise=True),
+                        NormalizeIntensityd(keys="image", nonzero=True, channel_wise=True),
                         RandScaleIntensityd(keys="image", factors=0.1, prob=1.0),
                         RandShiftIntensityd(keys="image", offsets=0.1, prob=1.0),
                     ]
@@ -550,7 +555,7 @@ class Flare3DPatchDataset(Dataset):
                                     num_samples=1,
                                     image_key="image",
                                     image_threshold=0),
-                SafeNormalizeIntensityd(keys="image", nonzero=True, channel_wise=True),
+                NormalizeIntensityd(keys="image", nonzero=True, channel_wise=True),
             ]
             return Compose(initial_transforms + val_transforms)
 
@@ -596,32 +601,35 @@ class Flare3DPatchDataset(Dataset):
 # Example usage:
 if __name__ == "__main__":
 #     # Assuming hf_dataset is already defined and loaded
-    patch_size = (1000, 1000)  # Example patch size
-    # hf_dataset = load_dataset("./local_flare_loader.py", name="train_mri_unlabeled", data_dir="/scratch/work/zhul2/data/FLARE-MedFM/FLARE-Task3-DomainAdaption", trust_remote_code=True)["train"]
+    patch_size = (224, 224)  # Example patch size
+    hf_dataset = load_dataset("./local_flare_loader.py", name="train_ct_gt", data_dir="/scratch/work/zhul2/data/FLARE-MedFM/FLARE-Task3-DomainAdaption", trust_remote_code=True)["train"]
     # dataset = OnTheFly2DDataset(hf_dataset, patch_size=patch_size, is_train=True, is_contrastive=True, has_label=True)
-    dataset = Flare2DDataset(
-        data_path="/scratch/work/zhul2/data/FLARE-MedFM/processed_2d_flare/train_ct_gt",
+    dataset = OnTheFly2DDataset(
+        hf_dataset,
         patch_size=patch_size, is_train=True, is_contrastive=True, has_label=True
     )
-    for i in range(len(dataset)):
-        samples = dataset[i]
-        print(samples["image"].shape, samples["label"].shape)
-        print(torch.unique(samples["image"]).shape)
-        # visualize the first sample and label
-        if i < 3:
-            import matplotlib.pyplot as plt
-            plt.figure(figsize=(10, 5))
-            plt.subplot(1, 2, 1)
-            plt.imshow(samples["image"].squeeze().numpy(), cmap='gray')
-            plt.title("Image")
-            plt.axis('off')
-            plt.subplot(1, 2, 2)
-            if samples["label"].numel() > 0:
-                plt.imshow(samples["label"].squeeze().numpy(), cmap='jet', alpha=0.5)
-                plt.title("Label")
-                plt.axis('off')
-            plt.show()
-            plt.savefig(f"sample_image_label_{i}.png")
-        else:
-            break
+    # plot image, image2
+    # visualize a batch of images
+    import matplotlib.pyplot as plt
+    from torch.utils.data import DataLoader
+    dataloader = DataLoader(dataset, batch_size=2, shuffle=True)
+    batch = next(iter(dataloader))
+    images = batch["image"]
+    images2 = batch["image2"]
+    labels = batch["label"] if "label" in batch else torch.tensor([])
+    print("unique labels:", len(torch.unique(labels)))
+    print(f"Batch size: {len(images)}")
+    print(f"Image shape: {images[0].shape}")
+    print(f"Image2 shape: {images2[0].shape}")
+    print(f"Label shape: {labels[0].shape}")
+    # Plot the first image and its corresponding label
+    fig, axs = plt.subplots(1, 3, figsize=(15, 5))
+    axs[0].imshow(images[0].squeeze().cpu().numpy(), cmap='gray')
+    axs[0].set_title("Image 1")
+    axs[1].imshow(images2[0].squeeze().cpu().numpy(), cmap='gray')
+    axs[1].set_title("Image 2")
+    if labels.numel() > 0:
+        axs[2].imshow(labels[0].squeeze().cpu().numpy(), cmap='gray')
+    plt.show()
+    plt.savefig("example_batch.png")
 

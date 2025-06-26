@@ -41,11 +41,11 @@ class DoubleConv(nn.Module):
         self.double_conv = nn.Sequential(
             nn.Conv2d(in_channels, mid_channels, kernel_size=3, padding=1, bias=use_bias),
             get_norm_layer(norm, mid_channels),
-            nn.LeakyReLU(inplace=True),
+            nn.ReLU(inplace=True),
             nn.Dropout2d(p=dropout),
             nn.Conv2d(mid_channels, out_channels, kernel_size=3, padding=1, bias=use_bias),
             get_norm_layer(norm, out_channels),
-            nn.LeakyReLU(inplace=True),
+            nn.ReLU(inplace=True),
             nn.Dropout2d(p=dropout)
         )
 
@@ -174,7 +174,7 @@ class Projector_Pool(nn.Module):
             nn.AdaptiveAvgPool2d((1, 1)),
             nn.Flatten(),
             nn.Linear(in_channels, proj_hidden_dim),
-            nn.LeakyReLU(inplace=True),
+            nn.ReLU(inplace=True),
             nn.Linear(proj_hidden_dim, proj_output_dim),
         )
 
@@ -186,10 +186,11 @@ class Projector_Conv(nn.Module):
         super().__init__()
         self.projector_head = nn.Sequential(
             nn.Conv2d(in_channels, 1, kernel_size=1, bias=False),
+            nn.ReLU(inplace=True),
             nn.Flatten(),
             nn.Linear(proj_hidden_dim, proj_output_dim), # add group norm to the nn.Linear layer
             nn.GroupNorm(num_groups=4, num_channels=proj_output_dim),
-            nn.LeakyReLU(inplace=True),
+            nn.ReLU(inplace=True),
             nn.Linear(proj_output_dim, proj_output_dim),
         )
 

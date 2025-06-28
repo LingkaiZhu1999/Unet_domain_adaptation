@@ -33,6 +33,7 @@ from monai.transforms import (
     RandCropByPosNegLabeld,
     Resized,
     RandZoomd,
+    RandHistogramShiftd,
 )
 
 from monai.data import NibabelReader
@@ -139,7 +140,7 @@ class LoadSlice(MapTransform):
     It loads the 3D volume into memory ONCE, finds all valid slice indices
     using fast, vectorized NumPy operations, and then randomly selects one.
     """
-    def __init__(self, keys: list, axis: int = 2, label_key: str = 'label', num_classes: int = NUM_CLASSES):
+    def __init__(self, keys: list, axis: int = 2, label_key: str = 'label', num_classes: int = NUM_CLASSES, slice_based: bool = False):
         """
         Args:
             keys: Keys in the data dictionary to load slices for.
@@ -153,6 +154,7 @@ class LoadSlice(MapTransform):
         self.label_key = label_key
         self.axis = axis  # Store the original axis for reference
         self.num_classes = num_classes
+        self.slice_based = slice_based
         # normalize the categorical logits
         self.categorical_logits = 70. / torch.tensor([1201., 135., 189., 74., 70., 43., 2., 3., 26., 8., 176., 41., 139.])
         self.categorical_logits = torch.concat((torch.tensor([0.01]), self.categorical_logits))  # Add a small weight for the background class
@@ -179,10 +181,8 @@ class LoadSlice(MapTransform):
             slice_has_class = [
                 (volume_np == c).any(axis=sum_axes) for c in include_class_values
             ]
-
             # Stack the 1D arrays into a 2D array (num_classes, num_slices)
             stacked_presences = np.stack(slice_has_class, axis=0)
-
             # A slice is valid only if it has ALL classes.
             # np.all(axis=0) finds slices where every class is present.
             slice_has_all_classes = np.all(stacked_presences, axis=0)
@@ -210,17 +210,25 @@ class LoadSlice(MapTransform):
         
         # if stik_volumes and np_volumes exists
         # --- Step 4: Choose a slice index ---
-        if len(valid_indices) > 0:
-            slice_idx = random.choice(valid_indices)
+        if self.slice_based:
+            # sample two slices
+            slice_idx1 = random.choice(valid_indices)
+            # sample based on gaussian distribution
+            slice_idx2 = int(np.random.normal(loc=slice_idx1, scale=0.5))
+            # Ensure slice_idx2 is within bounds
+            slice_idx2 = max(0, min(slice_idx2, len(valid_indices) - 1))
+            # Store both indices in the dictionary
+            for key, volume_np in np_volumes.items():
+                slice1 = np.take(volume_np, slice_idx1, axis=self.np_axis)
+                slice2 = np.take(volume_np, slice_idx2, axis=self.np_axis)
+                d[key] = slice1
+                if key == "image":
+                    d["image2"] = slice2
         else:
-            # Fallback: if entire volume is blank, get depth from original sitk object
-            # Using 'image' as the reference for size.
-            raise ValueError(f"No valid slices found in {image_path}. The volume may be empty or all slices have zero variance.")
-            
-        # --- Step 5: Extract the chosen slice from each NumPy volume ---
-        for key, volume_np in np_volumes.items():
-            # Use np.take to select the slice along the correct axis
-            d[key] = np.take(volume_np, slice_idx, axis=self.np_axis)
+            slice_idx = random.choice(valid_indices)
+            for key, volume_np in np_volumes.items():
+                slice_data = np.take(volume_np, slice_idx, axis=self.np_axis)
+                d[key] = slice_data
         return d
 
 
@@ -229,11 +237,12 @@ class OnTheFly2DDataset(Dataset):
     An efficient 2D Dataset that loads slices on-the-fly.
     Generates two different augmented views for contrastive learning if enabled.
     """
-    def __init__(self, hf_dataset, patch_size=(224, 192), is_train=True, is_contrastive=False, has_label=True):
+    def __init__(self, hf_dataset, patch_size=(224, 192), is_train=True, is_contrastive=False, has_label=True, slice_based=False):
         self.is_train = is_train
         self.patch_size = patch_size
         self.is_contrastive = is_contrastive
         self.has_label = has_label
+        self.slice_based = slice_based
 
         self.data_dicts = []
         for item in hf_dataset:
@@ -255,20 +264,26 @@ class OnTheFly2DDataset(Dataset):
 
     def _get_base_transforms(self):
         """Common transforms for both pipelines (loading and initial formatting)."""
-
-        return Compose([
-            LoadSlice(keys=["image", "label"]),
-            EnsureChannelFirstd(keys=["image", "label"], channel_dim="no_channel", allow_missing_keys=True),
-            EnsureTyped(keys="image", dtype=torch.float32),
+        # Patch-wise Gaussian noise
+        if self.slice_based:
+            xforms = [
+                LoadSlice(keys=["image", "image2", "label"], slice_based=True),
+            ]
+        else:
+            xforms = [
+                LoadSlice(keys=["image", "label"], slice_based=False),
+            ]
+        xforms.extend([EnsureChannelFirstd(keys=["image", "image2", "label"], channel_dim="no_channel", allow_missing_keys=True),
+            EnsureTyped(keys=["image", "image2"], dtype=torch.float32, allow_missing_keys=True),
             EnsureTyped(keys="label", dtype=torch.int8, allow_missing_keys=True),
             Lambdad(
             keys="label", 
             func=lambda x: torch.clamp(x, min=0, max=NUM_CLASSES - 1),
             allow_missing_keys=True
                 ),
-            ClipIntensityPercentiled(keys="image", lower_percentile=0.5, upper_percentile=99.5),
-            Resized(keys=["image", "label"], spatial_size=(512, 512), allow_missing_keys=True),
-        ])
+            ClipIntensityPercentiled(keys=["image", "image2"], lower_percentile=5, upper_percentile=95),
+            Resized(keys=["image", "image2", "label"], spatial_size=(512, 512), allow_missing_keys=True)])
+        return Compose(xforms)
 
     def _get_weak_transforms(self):
         """Standard augmentations for training (view x) or validation."""
@@ -276,11 +291,11 @@ class OnTheFly2DDataset(Dataset):
 
         if self.is_train:
             xforms.extend([
-                RandSpatialCropd(keys=["image", "label"], roi_size=self.patch_size, allow_missing_keys=True),
-                RandFlipd(keys=["image", "label"], prob=0.5, spatial_axis=1, allow_missing_keys=True), # Horizontal flip
-                RandRotate90d(keys=["image", "label"], prob=0.5, max_k=3, spatial_axes=(0, 1), allow_missing_keys=True),
+                RandSpatialCropd(keys=["image", "label", "image2"], roi_size=self.patch_size, allow_missing_keys=True),
+                RandFlipd(keys=["image", "image2", "label"], prob=0.5, spatial_axis=1, allow_missing_keys=True), # Horizontal flip
+                RandRotate90d(keys=["image", "label", "image2"], prob=0.5, max_k=3, spatial_axes=(0, 1), allow_missing_keys=True),
             ])
-        xforms.append(NormalizeIntensityd(keys="image", nonzero=True, channel_wise=True))
+        xforms.append(NormalizeIntensityd(keys=["image", "image2"], nonzero=True, channel_wise=True, allow_missing_keys=True))
         return Compose(xforms)
 
     def _get_strong_transforms(self):
@@ -322,9 +337,11 @@ class OnTheFly2DDataset(Dataset):
             ),
             # --- Intensity and Appearance Augmentations (applied in a random order) ---
             RandomOrder([
-            RandGaussianSmoothd(keys="image", sigma_x=(1, 2), sigma_y=(1, 2), prob=prob_intensity_appearance),
+            RandGaussianSmoothd(keys="image", sigma_x=(0.5, 1.5), sigma_y=(0.5, 1.5), prob=prob_intensity_appearance),
             RandScaleIntensityd(keys="image", factors=0.1, prob=prob_intensity_appearance),
-            RandAdjustContrastd(keys="image", gamma=(0.75, 1.25), prob=prob_intensity_appearance),
+            RandAdjustContrastd(keys="image", gamma=(0.5, 2.0), prob=prob_intensity_appearance),
+            # RandShiftIntensityd(keys="image", offsets=(-0.1, 0.1), prob=prob_intensity_appearance),
+            # RandHistogramShiftd(keys="image", num_control_points=(5, 15), prob=prob_intensity_appearance)
             ]),
             
              # --- Noise and Dropout ---
@@ -332,7 +349,7 @@ class OnTheFly2DDataset(Dataset):
             RandCoarseDropoutd(
                 keys=["image", "label"],
                 holes=1, max_holes=3,
-                spatial_size=(8, 8), max_spatial_size=(16, 16),
+                spatial_size=(16, 16), max_spatial_size=(32, 32),
                 fill_value=0, # Use 0 for background
                 prob=prob_drop,
                 allow_missing_keys=True
@@ -361,9 +378,18 @@ class OnTheFly2DDataset(Dataset):
 
         if self.is_contrastive:
             processed_data = self.base_transforms(clean_dict)
+            # process (image and label), and image2 seperately for strong transforms
+            if "image2" in processed_data:
+                if self.has_label and "label" in processed_data:
+                    processed_data1 = self.strong_transforms({"image": processed_data["image"], "label": processed_data["label"]})
+                else:
+                    processed_data1 = self.strong_transforms({"image": processed_data["image"]})
+                processed_data2 = self.strong_transforms({"image": processed_data["image2"]})
+            else:
+                processed_data1 = self.strong_transforms({"image": processed_data["image"], "label": processed_data["label"]})
+                processed_data2 = self.strong_transforms({"image": processed_data["image"]})
             # Apply the strong transforms to generate two augmented views
-            processed_data1 = self.strong_transforms(processed_data)
-            processed_data2 = self.strong_transforms(processed_data)
+            
             if self.has_label and "label" in processed_data1:
                 return {
                     "image": processed_data1["image"],
@@ -399,7 +425,7 @@ if __name__ == "__main__":
     # dataset = OnTheFly2DDataset(hf_dataset, patch_size=patch_size, is_train=True, is_contrastive=True, has_label=True)
     dataset = OnTheFly2DDataset(
         hf_dataset,
-        patch_size=patch_size, is_train=True, is_contrastive=True, has_label=True
+        patch_size=patch_size, is_train=True, is_contrastive=True, has_label=True, slice_based=True
     )
     # plot image, image2
     # visualize a batch of images
@@ -408,6 +434,8 @@ if __name__ == "__main__":
     dataloader = DataLoader(dataset, batch_size=2, shuffle=True)
     batch = next(iter(dataloader))
     images = batch["image"]
+    if "image2" not in batch:
+        batch["image2"] = images
     images2 = batch["image2"]
     labels = batch["label"] if "label" in batch else torch.tensor([])
     print("unique labels:", len(torch.unique(labels)))
@@ -422,7 +450,7 @@ if __name__ == "__main__":
     axs[1].imshow(images2[0].squeeze().cpu().numpy(), cmap='gray')
     axs[1].set_title("Image 2")
     if labels.numel() > 0:
-        axs[2].imshow(labels[0].squeeze().cpu().numpy(), cmap='gray')
+        axs[2].imshow(labels[0].squeeze().cpu().numpy())
     plt.show()
-    plt.savefig("example_batch.png")
+    plt.savefig("example_batch_mri.png")
 

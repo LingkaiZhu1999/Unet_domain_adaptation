@@ -34,7 +34,9 @@ from monai.transforms import (
     Resized,
     RandZoomd,
     RandHistogramShiftd,
-    RandGaussianSharpend
+    RandGaussianSharpend, 
+    ScaleIntensityRanged,
+    ScaleIntensityRangePercentilesd
 )
 
 from monai.data import NibabelReader
@@ -238,13 +240,13 @@ class OnTheFly2DDataset(Dataset):
     An efficient 2D Dataset that loads slices on-the-fly.
     Generates two different augmented views for contrastive learning if enabled.
     """
-    def __init__(self, hf_dataset, patch_size=(224, 192), is_train=True, is_contrastive=False, has_label=True, slice_based=False):
+    def __init__(self, hf_dataset, patch_size=(224, 192), is_train=True, is_contrastive=False, has_label=True, slice_based=False, volume_type="ct"):
         self.is_train = is_train
         self.patch_size = patch_size
         self.is_contrastive = is_contrastive
         self.has_label = has_label
         self.slice_based = slice_based
-
+        self.volume_type = volume_type
         self.data_dicts = []
         for item in hf_dataset:
             if item.get('image_path') and item['image_path'] != "N/A":
@@ -262,6 +264,7 @@ class OnTheFly2DDataset(Dataset):
         self.weak_transforms = self._get_weak_transforms()
         if self.is_contrastive:
             self.strong_transforms = self._get_strong_transforms()
+
 
     def _get_base_transforms(self):
         """Common transforms for both pipelines (loading and initial formatting)."""
@@ -282,7 +285,7 @@ class OnTheFly2DDataset(Dataset):
             func=lambda x: torch.clamp(x, min=0, max=NUM_CLASSES - 1),
             allow_missing_keys=True
                 ),
-            ClipIntensityPercentiled(keys=["image", "image2"], lower_percentile=5, upper_percentile=95),
+            # ClipIntensityPercentiled(keys=["image", "image2"], lower_percentile=5, upper_percentile=95),
             Resized(keys=["image", "image2", "label"], spatial_size=(512, 512), allow_missing_keys=True)])
         return Compose(xforms)
 
@@ -296,7 +299,10 @@ class OnTheFly2DDataset(Dataset):
                 RandFlipd(keys=["image", "image2", "label"], prob=0.5, spatial_axis=1, allow_missing_keys=True), # Horizontal flip
                 RandRotate90d(keys=["image", "label", "image2"], prob=0.5, max_k=3, spatial_axes=(0, 1), allow_missing_keys=True),
             ])
-        xforms.append(NormalizeIntensityd(keys=["image", "image2"], nonzero=True, channel_wise=True, allow_missing_keys=True))
+        if self.volume_type == "ct":
+            xforms.append(ScaleIntensityRanged(keys=["image", "image2"], a_min=-350, a_max=350, b_min=0, b_max=1, clip=True, allow_missing_keys=True))
+        elif self.volume_type == "mri":
+            xforms.append(ScaleIntensityRangePercentilesd(keys=["image", "image2"], lower=2, upper=98, b_min=0, b_max=1, clip=True, allow_missing_keys=True))
         return Compose(xforms)
 
     def _get_strong_transforms(self):
@@ -341,8 +347,8 @@ class OnTheFly2DDataset(Dataset):
             RandGaussianSmoothd(keys="image", sigma_x=(0.5, 2), sigma_y=(0.5, 2), prob=prob_intensity_appearance),
             RandScaleIntensityd(keys="image", factors=0.5, prob=prob_intensity_appearance),
             RandAdjustContrastd(keys="image", gamma=(0.5, 2), prob=prob_intensity_appearance),
-            # RandShiftIntensityd(keys="image", offsets=(-0.1, 0.1), prob=prob_intensity_appearance),
-            # RandHistogramShiftd(keys="image", num_control_points=3, prob=prob_intensity_appearance), 
+            RandShiftIntensityd(keys="image", offsets=(-0.1, 0.1), prob=prob_intensity_appearance),
+            # RandHistogramShiftd(keys="image", num_control_points=5, prob=1), 
             # RandGaussianSharpend(keys="image", prob=prob_intensity_appearance)
             ]),
             
@@ -357,8 +363,12 @@ class OnTheFly2DDataset(Dataset):
                 allow_missing_keys=True
             ), 
 
-            NormalizeIntensityd(keys="image", nonzero=True, channel_wise=True),
+            # NormalizeIntensityd(keys="image", nonzero=True, channel_wise=True),
         ])
+        if self.volume_type == "ct":
+            xforms.append(ScaleIntensityRanged(keys=["image", "image2"], a_min=-350, a_max=350, b_min=0, b_max=1, clip=True, allow_missing_keys=True))
+        elif self.volume_type == "mri":
+            xforms.append(ScaleIntensityRangePercentilesd(keys=["image", "image2"], lower=1, upper=99, b_min=0, b_max=1, clip=True, allow_missing_keys=True))
         return Compose(xforms)
     
     def __len__(self):
@@ -423,12 +433,12 @@ class OnTheFly2DDataset(Dataset):
 if __name__ == "__main__":
 #     # Assuming hf_dataset is already defined and loaded
     patch_size = (224, 224)  # Example patch size
-    name = "train_ct_gt"  # Example dataset name
+    name = "validation_mri"  # Example dataset name
     hf_dataset = load_dataset("./local_flare_loader.py", name=name, data_dir="/scratch/work/zhul2/data/FLARE-MedFM/FLARE-Task3-DomainAdaption", trust_remote_code=True)["train"]
     # dataset = OnTheFly2DDataset(hf_dataset, patch_size=patch_size, is_train=True, is_contrastive=True, has_label=True)
     dataset = OnTheFly2DDataset(
         hf_dataset,
-        patch_size=patch_size, is_train=True, is_contrastive=True, has_label=True, slice_based=True
+        patch_size=patch_size, is_train=False, is_contrastive=False, has_label=True, slice_based=False, volume_type="mri"
     )
     # plot image, image2
     # visualize a batch of images
@@ -462,4 +472,14 @@ if __name__ == "__main__":
         axs[1, 2].imshow(labels[1].squeeze().cpu().numpy())
     plt.show()
     plt.savefig(f"{name}_example.png")
+    # plot histogram of the two images
+    plt.figure(figsize=(10, 5))
+    plt.hist(images[0].cpu().numpy().flatten(), bins=100, alpha=0.5, label='Image 1')
+    plt.hist(images[1].cpu().numpy().flatten(), bins=100, alpha=0.5, label='Image 2')
+    plt.title("Histogram of Image Intensities")
+    plt.xlabel("Intensity")
+    plt.ylabel("Frequency")
+    plt.legend()
+    plt.show()
+    plt.savefig(f"{name}_histogram.png")
 

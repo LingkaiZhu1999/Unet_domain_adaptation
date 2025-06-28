@@ -216,11 +216,13 @@ def main():
     hf_val = load_dataset("./local_flare_loader.py", name=args.val_domain, data_dir=str(args.data_dir), trust_remote_code=True)["train"]
 
     # Datasets for contrastive training
-    source_dataset = FlarePatchDataset(hf_source, patch_size=args.patch_size, is_train=True, is_contrastive=True, has_label=True, slice_based=True if args.patch_generation == "slice-based" else False)
-    target_dataset = FlarePatchDataset(hf_target, patch_size=args.patch_size, is_train=True, is_contrastive=True, has_label=False, slice_based=True if args.patch_generation == "slice-based" else False)
+    source_dataset = FlarePatchDataset(hf_source, patch_size=args.patch_size, is_train=True, is_contrastive=True, has_label=True, 
+                                       slice_based=True if args.patch_generation == "slice-based" else False, volume_type="ct")
+    target_dataset = FlarePatchDataset(hf_target, patch_size=args.patch_size, is_train=True, is_contrastive=True, has_label=False, 
+                                       slice_based=True if args.patch_generation == "slice-based" else False, volume_type="mri")
 
     # Dataset for standard validation
-    val_dataset = FlarePatchDataset(hf_val, patch_size=args.patch_size, is_train=False, is_contrastive=False, has_label=True, slice_based=False)
+    val_dataset = FlarePatchDataset(hf_val, patch_size=args.patch_size, is_train=False, is_contrastive=False, has_label=True, slice_based=False, volume_type="mri")
 
     source_cached_dataset = CacheDataset(data=source_dataset, cache_rate=1., num_workers=args.num_workers)
     target_cached_dataset = CacheDataset(data=target_dataset, cache_rate=1., num_workers=args.num_workers)

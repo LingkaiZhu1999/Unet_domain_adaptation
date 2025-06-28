@@ -46,15 +46,20 @@ def parse_args():
     parser.add_argument('--validate_every', default=2, type=int)
     parser.add_argument('--patch_size', default=(512, 512), type=int, nargs=2, help='Patch size for training and validation')
     default_weights = 70 / torch.tensor([1201., 135., 189., 74., 70., 43., 2., 3., 26., 8., 176., 41., 139.])
-    default_weights = torch.concat((torch.tensor([0.01]), default_weights))  #
-    default_weights = torch.clamp(default_weights, max=10.0, min=0.1)  # Clamp weights to avoid too high or too low values
+    default_weights = torch.concat((70 / torch.tensor([1500]), default_weights))  #
+    # normalize weights to between 0 and 1
+    default_weights = default_weights / default_weights.max()  # Normalize weights to [0, 1]
+    # default_weights = torch.clamp(default_weights, max=20.0, min=0.01)  # Clamp weights to avoid too high or too low values
     parser.add_argument("--class_weights", default=default_weights, type=float, nargs='+',
                         help="Weights for each class in the loss function. Default is based on FLARE2024 Task 3 class distribution.")
+    parser.add_argument("--patch_generation", default="slice-based", choices=["slice-based", "aug-based"])
+    # if sliced-based, both slice-based and aug-based will be used
 
     # --- SegCLR Specific Hyperparameters ---
     parser.add_argument('--lam', default=1.0, type=float, help='Weight for the supervised loss')
     parser.add_argument('--temperature', default=0.1, type=float, help='Temperature for NT-Xent loss')
     parser.add_argument('--contrastive_mode', default='within_domain', choices=['inter_domain', 'within_domain', 'only_target_domain'])
+    parser.add_argument('--projector', default='pool', choices=['pool', 'conv'], help='Projection head type: "pool" for global average pooling, "conv" for convolutional projection')
 
     # --- System and Reproducibility ---
     parser.add_argument('--device', default='cuda:0')
@@ -65,7 +70,7 @@ def parse_args():
     
     args = parser.parse_args()
     if not args.name:
-        args.name = f"SegCLR_{args.source_domain1}_{args.source_domain2}_to_{args.target_domain}_lam{args.lam}_{args.contrastive_mode}_lr{args.lr}_{args.patch_size}_{args.seed}_exp{args.experiment_id}"
+        args.name = f"SegCLR_{args.source_domain1}_{args.source_domain2}_to_{args.target_domain}_projector{args.projector}_lam{args.lam}_{args.contrastive_mode}_lr{args.lr}_{args.patch_size}_{args.seed}_exp{args.experiment_id}"
     return args
 
 # --- 2. Training and Validation Functions (Adapted for SegCLR) ---
@@ -211,11 +216,11 @@ def main():
     hf_val = load_dataset("./local_flare_loader.py", name=args.val_domain, data_dir=str(args.data_dir), trust_remote_code=True)["train"]
 
     # Datasets for contrastive training
-    source_dataset = FlarePatchDataset(hf_source, patch_size=args.patch_size, is_train=True, is_contrastive=True, has_label=True)
-    target_dataset = FlarePatchDataset(hf_target, patch_size=args.patch_size, is_train=True, is_contrastive=True, has_label=False)
+    source_dataset = FlarePatchDataset(hf_source, patch_size=args.patch_size, is_train=True, is_contrastive=True, has_label=True, slice_based=True if args.patch_generation == "slice-based" else False)
+    target_dataset = FlarePatchDataset(hf_target, patch_size=args.patch_size, is_train=True, is_contrastive=True, has_label=False, slice_based=True if args.patch_generation == "slice-based" else False)
 
     # Dataset for standard validation
-    val_dataset = FlarePatchDataset(hf_val, patch_size=args.patch_size, is_train=False, is_contrastive=False, has_label=True)
+    val_dataset = FlarePatchDataset(hf_val, patch_size=args.patch_size, is_train=False, is_contrastive=False, has_label=True, slice_based=False)
 
     source_cached_dataset = CacheDataset(data=source_dataset, cache_rate=1., num_workers=args.num_workers)
     target_cached_dataset = CacheDataset(data=target_dataset, cache_rate=1., num_workers=args.num_workers)
@@ -228,11 +233,11 @@ def main():
     target_iterator = cycle(target_loader)
     
     # --- Model, Losses, Optimizer ---
-    model = Unet_SegCLR(in_channels=1, out_channels=args.output_channel, proj_hidden_dim=1024).to(device)
+    model = Unet_SegCLR(in_channels=1, out_channels=args.output_channel, proj_hidden_dim=1024, projector=args.projector).to(device)
     # limit of compile to be 64
     torch._dynamo.config.cache_size_limit = 64
     model = torch.compile(model, mode="max-autotune")
-
+    
     sup_criterion = MultiClassDiceCELoss(num_classes=args.output_channel, weight=torch.tensor(args.class_weights)).to(device)
     con_criterion = NTXentLoss(device, args.batch_size, args.temperature, use_cosine_similarity=True)
     

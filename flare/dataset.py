@@ -34,6 +34,7 @@ from monai.transforms import (
     Resized,
     RandZoomd,
     RandHistogramShiftd,
+    RandGaussianSharpend
 )
 
 from monai.data import NibabelReader
@@ -214,9 +215,9 @@ class LoadSlice(MapTransform):
             # sample two slices
             slice_idx1 = random.choice(valid_indices)
             # sample based on gaussian distribution
-            slice_idx2 = int(np.random.normal(loc=slice_idx1, scale=0.5))
+            slice_idx2 = int(np.random.normal(loc=slice_idx1, scale=1))
             # Ensure slice_idx2 is within bounds
-            slice_idx2 = max(0, min(slice_idx2, len(valid_indices) - 1))
+            slice_idx2 = max(0, min(slice_idx2, np_volumes['image'].shape[self.np_axis] - 1))
             # Store both indices in the dictionary
             for key, volume_np in np_volumes.items():
                 slice1 = np.take(volume_np, slice_idx1, axis=self.np_axis)
@@ -302,8 +303,8 @@ class OnTheFly2DDataset(Dataset):
         """Strong augmentations for the second contrastive view (x')."""
         
         xforms = []
-        prob_intensity_appearance = 0.8
-        prob_shape = 1.0
+        prob_intensity_appearance = 0.5
+        prob_shape = 0.5
         prob_noise = 0.2
         prob_drop = 0.2
 
@@ -320,7 +321,7 @@ class OnTheFly2DDataset(Dataset):
                 keys=["image", "label"],
                 prob=prob_shape,
                 # scale_range=((0, 0.15), (0, 0.15)), 
-                translate_range=(self.patch_size[0] * 0.15, self.patch_size[1] * 0.15),
+                translate_range=(self.patch_size[0] * 0.25, self.patch_size[1] * 0.25),
                 # rotate_range=(np.pi / 12,), # Rotate up to 30 degrees
                 mode=("bilinear", "nearest"),
                 padding_mode="reflection",
@@ -337,11 +338,12 @@ class OnTheFly2DDataset(Dataset):
             ),
             # --- Intensity and Appearance Augmentations (applied in a random order) ---
             RandomOrder([
-            RandGaussianSmoothd(keys="image", sigma_x=(0.5, 1.5), sigma_y=(0.5, 1.5), prob=prob_intensity_appearance),
-            RandScaleIntensityd(keys="image", factors=0.1, prob=prob_intensity_appearance),
-            RandAdjustContrastd(keys="image", gamma=(0.5, 2.0), prob=prob_intensity_appearance),
+            RandGaussianSmoothd(keys="image", sigma_x=(0.5, 2), sigma_y=(0.5, 2), prob=prob_intensity_appearance),
+            RandScaleIntensityd(keys="image", factors=0.5, prob=prob_intensity_appearance),
+            RandAdjustContrastd(keys="image", gamma=(0.5, 2), prob=prob_intensity_appearance),
             # RandShiftIntensityd(keys="image", offsets=(-0.1, 0.1), prob=prob_intensity_appearance),
-            # RandHistogramShiftd(keys="image", num_control_points=(5, 15), prob=prob_intensity_appearance)
+            # RandHistogramShiftd(keys="image", num_control_points=3, prob=prob_intensity_appearance), 
+            # RandGaussianSharpend(keys="image", prob=prob_intensity_appearance)
             ]),
             
              # --- Noise and Dropout ---
@@ -421,7 +423,8 @@ class OnTheFly2DDataset(Dataset):
 if __name__ == "__main__":
 #     # Assuming hf_dataset is already defined and loaded
     patch_size = (224, 224)  # Example patch size
-    hf_dataset = load_dataset("./local_flare_loader.py", name="train_ct_gt", data_dir="/scratch/work/zhul2/data/FLARE-MedFM/FLARE-Task3-DomainAdaption", trust_remote_code=True)["train"]
+    name = "train_ct_gt"  # Example dataset name
+    hf_dataset = load_dataset("./local_flare_loader.py", name=name, data_dir="/scratch/work/zhul2/data/FLARE-MedFM/FLARE-Task3-DomainAdaption", trust_remote_code=True)["train"]
     # dataset = OnTheFly2DDataset(hf_dataset, patch_size=patch_size, is_train=True, is_contrastive=True, has_label=True)
     dataset = OnTheFly2DDataset(
         hf_dataset,
@@ -431,7 +434,7 @@ if __name__ == "__main__":
     # visualize a batch of images
     import matplotlib.pyplot as plt
     from torch.utils.data import DataLoader
-    dataloader = DataLoader(dataset, batch_size=2, shuffle=True)
+    dataloader = DataLoader(dataset, batch_size=4, shuffle=True)
     batch = next(iter(dataloader))
     images = batch["image"]
     if "image2" not in batch:
@@ -444,13 +447,19 @@ if __name__ == "__main__":
     print(f"Image2 shape: {images2[0].shape}")
     print(f"Label shape: {labels[0].shape}")
     # Plot the first image and its corresponding label
-    fig, axs = plt.subplots(1, 3, figsize=(15, 5))
-    axs[0].imshow(images[0].squeeze().cpu().numpy(), cmap='gray')
-    axs[0].set_title("Image 1")
-    axs[1].imshow(images2[0].squeeze().cpu().numpy(), cmap='gray')
-    axs[1].set_title("Image 2")
+    fig, axs = plt.subplots(2, 3, figsize=(20, 10))
+    axs[0, 0].imshow(images[0].squeeze().cpu().numpy(), cmap='gray')
+    axs[0, 0].set_title("Image 1")
+    axs[0, 1].imshow(images2[0].squeeze().cpu().numpy(), cmap='gray')
+    axs[0, 1].set_title("Image 2")
     if labels.numel() > 0:
-        axs[2].imshow(labels[0].squeeze().cpu().numpy())
+        axs[0, 2].imshow(labels[0].squeeze().cpu().numpy())
+    axs[1, 0].imshow(images[1].squeeze().cpu().numpy(), cmap='gray')
+    axs[1, 0].set_title("Image 3")
+    axs[1, 1].imshow(images2[1].squeeze().cpu().numpy(), cmap='gray')
+    axs[1, 1].set_title("Image 4")
+    if labels.numel() > 0:
+        axs[1, 2].imshow(labels[1].squeeze().cpu().numpy())
     plt.show()
-    plt.savefig("example_batch_mri.png")
+    plt.savefig(f"{name}_example.png")
 

@@ -23,7 +23,7 @@ def get_norm_layer(norm_type: str, num_channels: int) -> nn.Module:
         return nn.InstanceNorm2d(num_channels)
     elif norm_type == 'group':
         # Using 8 groups is a common default choice.
-        return nn.GroupNorm(num_groups=8, num_channels=num_channels)
+        return nn.GroupNorm(num_groups=4, num_channels=num_channels)
     elif norm_type == 'none':
         return nn.Identity()
     else:
@@ -31,7 +31,7 @@ def get_norm_layer(norm_type: str, num_channels: int) -> nn.Module:
 
 
 class DoubleConv(nn.Module):
-    """(Convolution => Normalization => LReLU) * 2"""
+    """(Convolution => Normalization => ReLU) * 2"""
     def __init__(self, in_channels: int, out_channels: int, mid_channels: int = None,
                  dropout: float = 0.0, norm: str = 'instance'):
         super().__init__()
@@ -42,7 +42,6 @@ class DoubleConv(nn.Module):
             nn.Conv2d(in_channels, mid_channels, kernel_size=3, padding=1, bias=use_bias),
             get_norm_layer(norm, mid_channels),
             nn.ReLU(inplace=True),
-            nn.Dropout2d(p=dropout),
             nn.Conv2d(mid_channels, out_channels, kernel_size=3, padding=1, bias=use_bias),
             get_norm_layer(norm, out_channels),
             nn.ReLU(inplace=True),
@@ -76,11 +75,71 @@ class UpBlockInterpolate(nn.Module):
         x1 = F.interpolate(x1, size=x2.shape[2:], mode='bilinear', align_corners=False)
         x = torch.cat([x2, x1], dim=1)
         return self.conv(x)
+    
+# upscale by conv transpose
+# --- REVISED IMPLEMENTATION TO MATCH THE DIAGRAM ---
+# upscale by 3x3 conv transpose
+class UpBlockConvTranspose(nn.Module):
+    """
+    Upscaling using a 3x3 ConvTranspose2d to exactly match the provided diagram.
+    """
+    def __init__(self, in_channels: int, out_channels: int, dropout: float = 0.0, norm: str = 'group'):
+        """
+        Args:
+            in_channels: Number of channels from the layer below (e.g., 1024).
+            out_channels: Number of output channels for the block, which is also the
+                          number of channels in the skip connection (e.g., 512).
+        """
+        super().__init__()
+
+        # THE KEY CHANGE: Use kernel_size=3 with padding=1 and output_padding=1
+        # to achieve exact 2x upsampling.
+        # This layer will also halve the number of channels (e.g., 1024 -> 512).
+        self.up = nn.ConvTranspose2d(
+            in_channels, out_channels, kernel_size=3, stride=2, padding=1, output_padding=1
+        )
+
+        # After concatenating the skip connection (out_channels) and the upsampled tensor (out_channels),
+        # the input to the DoubleConv will have 2 * out_channels.
+        # The blue arrow in the diagram is a DoubleConv, which here takes (e.g., 512+512=1024) -> 512 channels.
+        self.conv = DoubleConv(
+            in_channels=2 * out_channels,
+            out_channels=out_channels,
+            mid_channels=out_channels,
+            dropout=dropout,
+            norm=norm
+        )
+        
+        # The diagram also shows dropout in the decoder path (red arrow).
+        # We can add it here if it's not already part of the DoubleConv.
+        # Since your DoubleConv includes dropout, we don't need an extra one here.
+
+    def forward(self, x1: torch.Tensor, x2: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x1: Tensor from the lower layer (to be upsampled). Shape: [B, C_in, H, W]
+            x2: Tensor from the corresponding skip connection. Shape: [B, C_out, 2H, 2W]
+        """
+        # 1. Upsample the lower-level feature map
+        x1 = self.up(x1) # Now produces a tensor of shape [B, C_out, 2H, 2W]
+
+        # Note: The padding/output_padding trick makes the F.pad below redundant for
+        # inputs with even dimensions, but it's good practice to keep it as a
+        # safeguard for inputs with odd dimensions.
+        diffY = x2.size()[2] - x1.size()[2]
+        diffX = x2.size()[3] - x1.size()[3]
+        if diffX != 0 or diffY != 0:
+             x1 = F.pad(x1, [diffX // 2, diffX - diffX // 2,
+                             diffY // 2, diffY - diffY // 2])
+
+        # 2. Concatenate along the channel dimension
+        x = torch.cat([x2, x1], dim=1)
+
+        # 3. Apply the double convolution block
+        return self.conv(x)
 
 
 # --- 2. Main U-Net Architecture ---
-
-# --- 2. Main U-Net Architecture (Corrected) ---
 
 class UNet(nn.Module):
     def __init__(self,
@@ -123,16 +182,16 @@ class UNet(nn.Module):
 
         # <<< --- CHANGED --- The UpBlock's input channels must account for skip connections.
         # The input to up1's convolution is (channels from x4_skip) + (channels from x5_upsampled)
-        self.up1 = UpBlockInterpolate(channel_list[3] + (channel_list[4] // factor), channel_list[3] // factor, dropout=dropout_rates[5], norm=norm)
-        
+        self.up1 = UpBlockConvTranspose(channel_list[4] // factor, channel_list[3] // factor, dropout=dropout_rates[5], norm=norm)
+
         # The input to up2's convolution is (channels from x3_skip) + (channels from d1_output)
-        self.up2 = UpBlockInterpolate(channel_list[2] + (channel_list[3] // factor), channel_list[2] // factor, dropout=dropout_rates[6], norm=norm)
-        
+        self.up2 = UpBlockConvTranspose(channel_list[3] // factor, channel_list[2] // factor, dropout=dropout_rates[6], norm=norm)
+
         # The input to up3's convolution is (channels from x2_skip) + (channels from d2_output)
-        self.up3 = UpBlockInterpolate(channel_list[1] + (channel_list[2] // factor), channel_list[1] // factor, dropout=dropout_rates[7], norm=norm)
+        self.up3 = UpBlockConvTranspose(channel_list[2] // factor, channel_list[1] // factor, dropout=dropout_rates[7], norm=norm)
 
         # The input to up4's convolution is (channels from x1_skip) + (channels from d3_output)
-        self.up4 = UpBlockInterpolate(channel_list[0] + (channel_list[1] // factor), channel_list[0], dropout=dropout_rates[8], norm=norm)
+        self.up4 = UpBlockConvTranspose(channel_list[1] // factor, channel_list[0], dropout=dropout_rates[8], norm=norm)
 
         self.out_conv = nn.Conv2d(channel_list[0], out_channels, kernel_size=1)
 
@@ -186,7 +245,6 @@ class Projector_Conv(nn.Module):
         super().__init__()
         self.projector_head = nn.Sequential(
             nn.Conv2d(in_channels, 1, kernel_size=1, bias=False),
-            nn.ReLU(inplace=True),
             nn.Flatten(),
             nn.Linear(proj_hidden_dim, proj_output_dim), # add group norm to the nn.Linear layer
             nn.GroupNorm(num_groups=4, num_channels=proj_output_dim),
@@ -200,18 +258,25 @@ class Projector_Conv(nn.Module):
     
 class Unet_SegCLR(nn.Module):
     """A U-Net model with a SimCLR projection head on the encoder's bottleneck."""
-    def __init__(self, in_channels: int, out_channels: int, proj_output_dim: int = 128, norm: str = 'instance', deep_supervision: bool = False,
-                 proj_hidden_dim: int = 1024):
+    def __init__(self, in_channels: int, out_channels: int, proj_output_dim: int = 128, norm: str = 'group', deep_supervision: bool = False,
+                 proj_hidden_dim: int = 1024, projector: str = 'pool'):
         super().__init__()
         # <<< --- PASS DEEP SUPERVISION FLAG TO UNET ---
         self.unet = UNet(in_channels, out_channels, norm=norm, deep_supervision=deep_supervision)
         
         bottleneck_channels = 1024
-        self.projector = Projector_Conv(
-            in_channels=bottleneck_channels,
-            proj_hidden_dim=proj_hidden_dim,
-            proj_output_dim=proj_output_dim
-        )
+        if projector == 'conv':
+            self.projector = Projector_Conv(
+                in_channels=bottleneck_channels,
+                proj_hidden_dim=proj_hidden_dim,
+                proj_output_dim=proj_output_dim
+            )
+        else:
+            self.projector = Projector_Pool(
+                in_channels=bottleneck_channels,
+                proj_hidden_dim=proj_hidden_dim,
+                proj_output_dim=proj_output_dim
+            )
 
     def forward(self, x: torch.Tensor, has_label=True) -> Tuple[torch.Tensor, Union[torch.Tensor, List[torch.Tensor]]]:
         # --- Encoder Path ---
@@ -274,9 +339,11 @@ if __name__ == "__main__":
     # assert ds_outputs[-1].shape == standard_input.shape[:1] + (3,) + standard_input.shape[2:]
 
     print("\n--- Testing Unet_SegCLR with Deep Supervision ---")
-    ds_segclr_net = Unet_SegCLR(in_channels=1, out_channels=14, deep_supervision=True).to(device)
+    ds_segclr_net = Unet_SegCLR(in_channels=1, out_channels=14, projector='pool').to(device)
     z, logits_list = ds_segclr_net(standard_input, has_label=False)
     # assert isinstance(logits_list, list) and len(logits_list) == 4
     print(f"Projection Vector (z) shape: {z.shape}") # Should be (2, 128)
     # print(f"Segmentation Logits is a list of {len(logits_list)} tensors.")
     print("Test successful: Models are robust to deep supervision flag.")
+    # print unet_segclr_net
+    # print(ds_segclr_net)

@@ -186,7 +186,7 @@ class LoadSlice(MapTransform):
         # normalize the categorical logits
         self.categorical_logits = 70. / torch.tensor([1201., 135., 189., 74., 70., 43., 2., 3., 26., 8., 176., 41., 139.])
         self.categorical_logits = torch.concat((torch.tensor([0.01]), self.categorical_logits))  # Add a small weight for the background class
-        self.categorical_logits = torch.clamp(self.categorical_logits, max=10.0, min=0.1)  # Clamp weights to avoid too high or too low values
+        self.categorical_logits = torch.clamp(self.categorical_logits, max=10.0, min=0.5)  # Clamp weights to avoid too high or too low values
         self.categorical_logits = self.categorical_logits / self.categorical_logits.sum()
         self.target_spacing = target_spacing
         self.image_interpolator = sitk.sitkLinear
@@ -356,10 +356,8 @@ class OnTheFly2DDataset(Dataset):
                     allow_missing_keys=True)])
         if self.volume_type == "ct":
             xforms.append(ScaleIntensityRanged(keys=["image", "image2"], a_min=-1000, a_max=1000, allow_missing_keys=True))
-            xforms.append(NormalizeIntensityd(keys=["image", "image2"], nonzero=False, channel_wise=True, allow_missing_keys=True))
         elif self.volume_type == "mri":
-            xforms.extend([ClipIntensityPercentilesd(keys=["image", "image2"], lower=0.5, upper=99.5, channel_wise=True, allow_missing_keys=True),
-                NormalizeIntensityd(keys=["image", "image2"], nonzero=False, channel_wise=True, allow_missing_keys=True)])
+            xforms.append(ClipIntensityPercentilesd(keys=["image", "image2"], lower=0.5, upper=99.5, channel_wise=True, allow_missing_keys=True))
         return Compose(xforms)
 
     def _get_weak_transforms(self):
@@ -378,14 +376,12 @@ class OnTheFly2DDataset(Dataset):
         """Strong augmentations for the second contrastive view (x')."""
         
         xforms = []
-        prob_intensity_appearance = 0.5
-        prob_shape = 0.5
+        prob_intensity_appearance = 0.8
+        prob_shape = 1.0
         prob_noise = 0.2
         prob_drop = 0.2
 
         # xforms.extend([RandSpatialCropd(keys=["image", "label"], roi_size=self.patch_size, random_size=False, allow_missing_keys=True)])
-
-      
             
         xforms.extend([
             # ResizeWithPadOrCropd(keys=["image", "label"], spatial_size=self.patch_size, allow_missing_keys=True),
@@ -416,9 +412,9 @@ class OnTheFly2DDataset(Dataset):
             RandomOrder([
             # RandGaussianSmoothd(keys="image", sigma_x=(0.5, 2), sigma_y=(0.5, 2), prob=prob_intensity_appearance),
             RandScaleIntensityd(keys="image", factors=0.5, prob=prob_intensity_appearance),
-            RandAdjustContrastd(keys="image", gamma=(0.5, 2), prob=prob_intensity_appearance),
-            RandShiftIntensityd(keys="image", offsets=(-0.1, 0.1), prob=prob_intensity_appearance),
-            RandRicianNoised(keys=["image"], prob=prob_noise, allow_missing_keys=True) if self.volume_type == "ct" else RandGaussianNoised(keys="image", std=0.01, prob=prob_noise)
+            RandAdjustContrastd(keys="image", gamma=(0.5, 4.5), prob=prob_intensity_appearance),
+            RandShiftIntensityd(keys="image", offsets=(-0.2, 0.2), prob=prob_intensity_appearance),
+            RandRicianNoised(keys=["image"], std=0.01, prob=prob_noise, allow_missing_keys=True) if self.volume_type == "ct" else RandGaussianNoised(keys="image", std=0.01, prob=prob_noise)
             # RandHistogramShiftd(keys="image", num_control_points=5, prob=1), 
             # RandGaussianSharpend(keys="image", prob=prob_intensity_appearance)
             ]),
@@ -438,6 +434,7 @@ class OnTheFly2DDataset(Dataset):
         ])
 
         # xforms.append(NormalizeIntensityd(keys=["image", "image2"], channel_wise=True, allow_missing_keys=True))
+        xforms.append(NormalizeIntensityd(keys=["image", "image2"], nonzero=False, channel_wise=True, allow_missing_keys=True))
         return Compose(xforms)
     
     def __len__(self):
